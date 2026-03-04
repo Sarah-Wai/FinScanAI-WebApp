@@ -23,13 +23,13 @@ export class ReceiptTableComponent {
   // inputs
   @Input() title = "Receipts";
   @Input() rows: ReceiptRow[] = [];
-  @Input() itemsPerPage = 8;
+  @Input() itemsPerPage = 10;
   @Input() newReceiptIds: number[] = [];
   private newSet = new Set<number>();
 
   // outputs (parent handles route/delete/backend)
   @Output() rowClick = new EventEmitter<number>();
-  @Output() viewClick = new EventEmitter<number>();
+  @Output() viewClick = new EventEmitter<{ id: number; ids: number[]; index: number }>();
   @Output() deleteClick = new EventEmitter<number>();
 
   // search + paging state (used by your HTML)
@@ -80,21 +80,32 @@ export class ReceiptTableComponent {
   }
 
   // row click (your HTML uses: (click)="onRow(item.id)")
-  onRow(id: number) {
-    this.rowClick.emit(id);
-  }
+  //onRow(id: number) {
+    //this.rowClick.emit(id);
+  //}
 
   // dropdown actions (your HTML uses: (click)="onView($event, item.id)")
-  onView(e: MouseEvent, id: number) {
-    e.stopPropagation();
-    this.viewClick.emit(id);
-  }
+ onView(e: MouseEvent, id: number, i: number) {
+  e.stopPropagation();
+
+  const ids = (this.filteredRows || []).map(r => Number(r.id)).filter(Number.isFinite);
+
+  // global index across filtered list = pageOffset + i
+  const start = (this.currentPage - 1) * this.itemsPerPage;
+  const index = start + i;
+
+  this.viewClick.emit({ id: Number(id), ids, index });
+}
+
 
   // badge color mapping (your HTML uses: [color]="getBadgeColor(item.status)")
-  getBadgeColor(status: ReceiptStatus): "success" | "warning" | "error" {
+  getBadgeColor(
+    status: ReceiptStatus,
+  ): "success" | "warning" | "error" | "info" {
     if (status === "Approved") return "success";
     if (status === "Pending") return "warning";
-    return "error";
+    if (status === "Failed") return "error";
+    return "info";
   }
 
   // total formatting (your HTML uses: {{ formatTotal(item.total) }})
@@ -111,6 +122,14 @@ export class ReceiptTableComponent {
 
   ngOnChanges(): void {
     this.newSet = new Set(this.newReceiptIds ?? []);
+
+    // Optional: if current page is now beyond total pages after filtering/data refresh, clamp it
+    if (this.currentPage > this.totalPages) {
+      this.currentPage = this.totalPages;
+    }
+    if (this.currentPage < 1) {
+      this.currentPage = 1;
+    }
   }
 
   isNew(id: number): boolean {

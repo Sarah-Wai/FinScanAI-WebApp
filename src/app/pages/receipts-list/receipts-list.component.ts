@@ -19,6 +19,7 @@ export class ReceiptsListComponent implements OnInit {
 
   newReceiptIds: number[] = []; // receipts that are NEW (unseen)
   private readonly NEW_KEY = "receipt_new_ids";
+
   constructor(
     private api: ReceiptApiService,
     private router: Router,
@@ -27,9 +28,10 @@ export class ReceiptsListComponent implements OnInit {
   ngOnInit(): void {
     this.loading = true;
     this.loadNewIds();
+
     this.api.listReceipts().subscribe({
       next: (rows) => {
-        this.receipts = rows;
+        this.receipts = rows ?? [];
         this.loading = false;
       },
       error: (err) => {
@@ -41,32 +43,49 @@ export class ReceiptsListComponent implements OnInit {
 
   private loadNewIds() {
     try {
-      this.newReceiptIds = JSON.parse(
-        localStorage.getItem(this.NEW_KEY) || "[]",
-      );
+      const raw = localStorage.getItem(this.NEW_KEY) || "[]";
+      const arr = JSON.parse(raw);
+      this.newReceiptIds = Array.isArray(arr) ? arr : [];
     } catch {
       this.newReceiptIds = [];
     }
   }
+
   private saveNewIds() {
     localStorage.setItem(this.NEW_KEY, JSON.stringify(this.newReceiptIds));
   }
 
-  // called by table rowClick/viewClick
-  openDetail(receiptId: number): void {
+  openDetail(
+    payload: number | { id: number; ids: number[]; index: number },
+  ): void {
+    const receiptId =
+      typeof payload === "number" ? payload : Number(payload.id);
+
     // mark as seen
     const before = this.newReceiptIds.length;
     this.newReceiptIds = this.newReceiptIds.filter((id) => id !== receiptId);
     if (this.newReceiptIds.length !== before) this.saveNewIds();
 
-    // navigate
+    // viewClick case: pass ids/index to detail using router state
+    if (typeof payload !== "number") {
+      this.router.navigate(["/receipts", receiptId], {
+        state: { ids: payload.ids ?? [], index: payload.index ?? -1 },
+      });
+      return;
+    }
+
+    // rowClick case: normal navigate (no ids/index)
     this.router.navigate(["/receipts", receiptId]);
   }
 
   deleteReceipt(id: number) {
     // later: call backend delete API
     this.receipts = this.receipts.filter((r) => r.id !== id);
-    this.saveNewIds();
+
+    // also remove from "new" list if present
+    const before = this.newReceiptIds.length;
+    this.newReceiptIds = this.newReceiptIds.filter((x) => x !== id);
+    if (this.newReceiptIds.length !== before) this.saveNewIds();
   }
 
   goToUpload() {

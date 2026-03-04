@@ -1,4 +1,5 @@
-export type ReceiptStatus = 'Approved' | 'Pending' | 'Rejected';
+export type ReceiptStatus = 'Approved' | 'Pending' | 'Rejected' |"Processed" |"Failed";
+
 
 export interface ReceiptRow {
   id: number;
@@ -18,6 +19,7 @@ export interface ReceiptDetailItem {
   currency: string;
   unitPrice: number;
   confidence: number;
+  validationStatus?: string;
 }
 
 export interface ReceiptDetail {
@@ -31,4 +33,5 @@ export interface ReceiptDetail {
   status: ReceiptStatus;
   confidence: number;
   items: ReceiptDetailItem[];
+  source_id:string
 }

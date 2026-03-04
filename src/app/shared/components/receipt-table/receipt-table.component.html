@@ -1,5 +1,5 @@
 <div class="rounded-2xl border border-gray-200 bg-white pt-4 dark:border-white/[0.05] dark:bg-white/[0.03]">
-  <div class="flex flex-col gap-2 px-5 mb-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+  <div class="mb-4 flex flex-col gap-2 px-5 sm:flex-row sm:items-center sm:justify-between sm:px-6">
     <div>
       <h3 class="text-lg font-semibold text-gray-800 dark:text-white/90">
         {{ title }}
@@ -9,7 +9,7 @@
     <div class="flex flex-col gap-3 sm:flex-row sm:items-center">
       <form (submit)="$event.preventDefault()">
         <div class="relative">
-          <button class="absolute -translate-y-1/2 left-4 top-1/2" type="button">
+          <button class="absolute left-4 top-1/2 -translate-y-1/2" type="button">
             <!-- search icon -->
             <svg class="fill-gray-500 dark:fill-gray-400" width="20" height="20" viewBox="0 0 20 20" fill="none"
               xmlns="http://www.w3.org/2000/svg">
@@ -19,81 +19,94 @@
             </svg>
           </button>
 
-          <input type="text" [(ngModel)]="searchText" (ngModelChange)="onSearchChange()" name="q"
+          <input
+            type="text"
+            [(ngModel)]="searchText"
+            (ngModelChange)="onSearchChange()"
+            name="q"
             placeholder="Search receipts..."
-            class="dark:bg-dark-900 h-[42px] w-full rounded-lg border border-gray-300 bg-transparent py-2.5 pl-[42px] pr-4 text-sm text-gray-800 shadow-theme-xs placeholder:text-gray-400 focus:border-brand-300 focus:outline-hidden focus:ring-3 focus:ring-brand-500/10 dark:border-gray-700 dark:bg-gray-900 dark:text-white/90 dark:placeholder:text-white/30 dark:focus:border-brand-800 xl:w-[300px]" />
+            class="dark:bg-dark-900 h-[42px] w-full rounded-lg border border-gray-300 bg-transparent py-2.5 pl-[42px] pr-4 text-sm text-gray-800 shadow-theme-xs placeholder:text-gray-400 focus:border-brand-300 focus:outline-hidden focus:ring-3 focus:ring-brand-500/10 dark:border-gray-700 dark:bg-gray-900 dark:text-white/90 dark:placeholder:text-white/30 dark:focus:border-brand-800 xl:w-[300px]"
+          />
         </div>
       </form>
     </div>
   </div>
 
   <div class="overflow-hidden">
-    <div class="max-w-full px-5 overflow-x-auto sm:px-6">
+    <div class="max-w-full overflow-x-auto px-5 sm:px-6">
       <table class="min-w-full">
-        <thead class="border-gray-100 border-y dark:border-white/[0.05]">
+        <thead class="border-y border-gray-100 dark:border-white/[0.05]">
           <tr>
-            <th class="py-3 font-normal text-gray-500 text-start text-theme-sm dark:text-gray-400">Receipt</th>
-            <th class="px-4 py-3 font-normal text-gray-500 text-start text-theme-sm dark:text-gray-400">Vendor</th>
-            <th class="px-4 py-3 font-normal text-gray-500 text-start text-theme-sm dark:text-gray-400">Date</th>
-            <th class="px-4 py-3 font-normal text-gray-500 text-start text-theme-sm dark:text-gray-400">Total</th>
-            <th class="px-4 py-3 font-normal text-gray-500 text-start text-theme-sm dark:text-gray-400">Status</th>
-            <th class="px-4 py-3 font-normal text-gray-500 text-start text-theme-sm dark:text-gray-400">Confidence</th>
-            <th class="px-4 py-3 font-normal text-gray-500 text-start text-theme-sm dark:text-gray-400">
+            <th class="py-3 text-start text-theme-sm font-normal text-gray-500 dark:text-gray-400">Receipt</th>
+            <th class="px-4 py-3 text-start text-theme-sm font-normal text-gray-500 dark:text-gray-400">Vendor</th>
+            <th class="px-4 py-3 text-start text-theme-sm font-normal text-gray-500 dark:text-gray-400">Date</th>
+            <th class="px-4 py-3 text-start text-theme-sm font-normal text-gray-500 dark:text-gray-400">Total</th>
+            <th class="px-4 py-3 text-start text-theme-sm font-normal text-gray-500 dark:text-gray-400">Status</th>
+            <th class="px-4 py-3 text-start text-theme-sm font-normal text-gray-500 dark:text-gray-400">Confidence</th>
+            <th class="px-4 py-3 text-start text-theme-sm font-normal text-gray-500 dark:text-gray-400">
               <span class="sr-only">Action</span>
             </th>
           </tr>
         </thead>
-        <tbody class="divide-y divide-gray-100 dark:divide-white/[0.05]">
-          @for (item of currentItems; track item.id) {
 
-          <tr class="cursor-pointer hover:bg-gray-50 dark:hover:bg-white/[0.04]"
-            [ngClass]="{ 'bg-emerald-50 dark:bg-emerald-500/[0.08]': isNew(item.id) }" (click)="onRow(item.id)">
+        <tbody class="divide-y divide-gray-100 dark:divide-white/[0.05]">
+          <!-- ✅ FIX: add index -->
+          @for (item of currentItems; track item.id; let i = $index) {
+
+          <tr
+            class="cursor-pointer hover:bg-gray-50 dark:hover:bg-white/[0.04]"
+            [ngClass]="{ 'bg-emerald-50 dark:bg-emerald-500/[0.08]': isNew(item.id) }"
+            (click)="onView($event, item.id, i); $event.stopPropagation()"
+          >
             <!-- Receipt (icon + label) -->
-            <td class="px-4 py-4 relative overflow-visible">
-              <!-- ✅ NEW folded corner (does NOT affect alignment) -->
-              <span *ngIf="isNew(item.id)" class="pointer-events-none absolute left-0 top-0 z-10 h-0 w-0
-                 border-t-[20px] border-t-blue-600
-                 border-r-[20px] border-r-transparent"></span>
+            <td class="relative overflow-visible px-4 py-4">
+              <!-- NEW folded corner (does NOT affect alignment) -->
+              <span
+                *ngIf="isNew(item.id)"
+                class="pointer-events-none absolute left-0 top-0 z-10 h-0 w-0
+                       border-r-[20px] border-r-transparent
+                       border-t-[20px] border-t-blue-600"
+              ></span>
 
               <div class="flex items-center gap-3">
-                <div class="w-8 h-8">
-                  <img width="32" height="32" [src]="'/images/brand/brand-01.svg'" class="size-8" alt="receipt" />
+                <div class="h-8 w-8">
+                  <img width="32" height="32" [src]="'/images/brand/receipt-icon.png'" class="size-8" alt="receipt" />
                 </div>
 
                 <div>
-                  <span class="block font-medium text-gray-700 text-theme-sm dark:text-gray-200">
-                    Receipt
+                  <span class="block text-theme-sm font-medium text-gray-700 dark:text-gray-200">
+                    {{ item.receiptName }}
                   </span>
                   <span class="block text-xs text-gray-500 dark:text-gray-400">
-                    {{ item.vendor }}
+                    {{ item.id }}
                   </span>
                 </div>
               </div>
             </td>
 
-            <td class="px-4 py-4 text-gray-700 whitespace-nowrap text-theme-sm dark:text-gray-300">
+            <td class="whitespace-nowrap px-4 py-4 text-theme-sm text-gray-700 dark:text-gray-300">
               {{ item.vendor }}
             </td>
 
-            <td class="px-4 py-4 text-gray-700 whitespace-nowrap text-theme-sm dark:text-gray-300">
+            <td class="whitespace-nowrap px-4 py-4 text-theme-sm text-gray-700 dark:text-gray-300">
               {{ item.date }}
             </td>
 
-            <td class="px-4 py-4 text-gray-700 text-theme-sm dark:text-gray-300">
+            <td class="px-4 py-4 text-theme-sm text-gray-700 dark:text-gray-300">
               {{ formatTotal(item.total) }}
             </td>
 
-            <td class="px-4 py-4 text-gray-700 text-theme-sm dark:text-gray-300">
+            <td class="px-4 py-4 text-theme-sm text-gray-700 dark:text-gray-300">
               <app-badge size="sm" [color]="getBadgeColor(item.status)">
                 {{ item.status }}
               </app-badge>
             </td>
 
-            <td class="px-4 py-4 text-gray-700 text-theme-sm dark:text-gray-300">
+            <td class="px-4 py-4 text-theme-sm text-gray-700 dark:text-gray-300">
               {{ item.confidence }}%
             </td>
 
-            <td class="px-4 py-4 text-gray-700 text-theme-sm dark:text-gray-300">
+            <td class="px-4 py-4 text-theme-sm text-gray-700 dark:text-gray-300">
               <div class="relative inline-block">
                 <app-table-dropdown>
                   <div dropdown-button>
@@ -109,8 +122,9 @@
 
                   <div dropdown-content>
                     <button
-                      class="text-xs flex w-full rounded-lg px-3 py-2 text-left font-medium text-gray-500 hover:bg-gray-100 hover:text-gray-700 dark:text-gray-300 dark:hover:bg-white/5 dark:hover:text-gray-200"
-                      (click)="onView($event, item.id); $event.stopPropagation()">
+                      class="flex w-full rounded-lg px-3 py-2 text-left text-xs font-medium text-gray-500 hover:bg-gray-100 hover:text-gray-700 dark:text-gray-300 dark:hover:bg-white/5 dark:hover:text-gray-200"
+                      (click)="onView($event, item.id, i); $event.stopPropagation()"
+                    >
                       View
                     </button>
                   </div>
@@ -126,14 +140,12 @@
             </td>
           </tr>
         </tbody>
-
-
       </table>
     </div>
   </div>
 
   <!-- Pagination Controls -->
-  <div class="px-6 py-4 border-t border-gray-200 dark:border-white/[0.05]">
+  <div class="border-t border-gray-200 px-6 py-4 dark:border-white/[0.05]">
     <div class="flex items-center justify-between">
       <app-button size="sm" variant="outline" (btnClick)="goToPage(currentPage - 1)" [disabled]="currentPage === 1">
         <span class="hidden sm:inline">Previous</span>
@@ -146,11 +158,14 @@
       <ul class="hidden items-center gap-0.5 sm:flex">
         @for (page of [].constructor(totalPages); track $index; let idx = $index) {
         <li>
-          <button (click)="goToPage(idx + 1)"
-            class="flex h-10 w-10 items-center justify-center rounded-lg text-theme-sm font-medium" [ngClass]="{
+          <button
+            (click)="goToPage(idx + 1)"
+            class="flex h-10 w-10 items-center justify-center rounded-lg text-theme-sm font-medium"
+            [ngClass]="{
               'bg-brand-500 text-white': currentPage === idx + 1,
               'text-gray-700 hover:bg-brand-500/[0.08] dark:hover:bg-brand-500 dark:hover:text-white hover:text-brand-500 dark:text-gray-400': currentPage !== idx + 1
-            }">
+            }"
+          >
             {{ idx + 1 }}
           </button>
         </li>
