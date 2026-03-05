@@ -89,13 +89,19 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   private readonly LONG_FRAME_W = 720;          // 720~1080 (lower = faster)
   private readonly LONG_MAX_STITCH_H = 14000;   // avoid memory crash
   private readonly LONG_BLUR_MIN = 70;          // tune per device (variance Laplacian)
-  private readonly LONG_MIN_DY = 70;            // minimal movement to accept new content
+
+  // FIXED LONG MODE: use "append height" threshold instead of dy threshold
+  private readonly LONG_MIN_APPEND_H = 90;      // must append at least this many px each step
   private readonly LONG_STOP_NO_NEW = 10;       // auto stop if duplicates
 
   // Fast matching settings
-  private readonly LONG_MATCH_SCALE = 0.40;        // 0.35~0.55 (lower=faster)
+  private readonly LONG_MATCH_SCALE = 0.40;         // 0.35~0.55 (lower=faster)
   private readonly LONG_CENTER_STRIP_W_FRAC = 0.55; // match only center width
   private readonly LONG_STRIP_H_FRAC = 0.22;        // template height fraction
+
+  // FIXED LONG MODE: require match quality
+  private readonly LONG_MIN_MATCH_SCORE = 0.55;     // TM_CCOEFF_NORMED threshold
+  private readonly LONG_SEAM_PAD = 8;               // overlap padding to reduce seam
 
   constructor(private router: Router) {}
 
@@ -642,17 +648,26 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     const wasLong = this.isLongMode;
     this.isLongMode = false;
 
+    // cleanup references (avoid weird stale state)
+    const stitch = this.stitchCanvas;
+    this.stitchCanvas = undefined;
+    this.stitchCtx = null;
+    this.longFrameCanvas = undefined;
+    this.longFrameCtx = null;
+    this.prevFrameCanvas = undefined;
+    this.prevFrameCtx = null;
+
     if (!save || !wasLong) {
       this.cameraHint = 'Long mode canceled.';
       return;
     }
 
-    if (!this.stitchCanvas || !this.stitchCtx || this.stitchCanvas.height < 200) {
+    if (!stitch || stitch.height < 200) {
       this.cameraHint = 'Long mode: not enough captured. Try again slower.';
       return;
     }
 
-    this.postProcessAndAddSingle(this.stitchCanvas, 'camera');
+    this.postProcessAndAddSingle(stitch, 'camera');
     this.cameraHint = 'Saved long receipt as one image.';
   }
 
@@ -693,25 +708,38 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       return;
     }
 
-    // estimate vertical shift (FAST)
-    const dy = this.estimateVerticalShiftFast(this.prevFrameCanvas, this.longFrameCanvas);
-
-    if (dy < this.LONG_MIN_DY) {
+    // FIXED LONG MODE: estimate overlap cut line (not dy)
+    const match = this.estimateOverlapCutYFast(this.prevFrameCanvas, this.longFrameCanvas);
+    if (!match.ok) {
       this.noNewCount++;
-      this.cameraHint = 'Move down a bit…';
+      this.cameraHint = match.hint ?? 'Align center and move down slowly…';
       if (this.noNewCount >= this.LONG_STOP_NO_NEW) {
-        this.cameraHint = 'No new content detected—auto saving.';
+        this.cameraHint = 'No reliable new content—auto saving.';
+        this.stopLongReceipt(true);
+      }
+      return;
+    }
+
+    // cutFromTop = where overlap ends in current frame
+    let cutFromTop = match.cutY;
+
+    // seam padding (keep a little overlap so text lines don’t break)
+    cutFromTop = Math.max(0, Math.min(H - 1, cutFromTop - this.LONG_SEAM_PAD));
+
+    const newH = H - cutFromTop;
+
+    // require enough new content
+    if (newH < this.LONG_MIN_APPEND_H) {
+      this.noNewCount++;
+      this.cameraHint = 'Move down a bit more…';
+      if (this.noNewCount >= this.LONG_STOP_NO_NEW) {
+        this.cameraHint = 'Not enough new content—auto saving.';
         this.stopLongReceipt(true);
       }
       return;
     }
 
     this.noNewCount = 0;
-
-    // append only new region
-    const newY = dy;
-    const newH = H - newY;
-    if (newH <= 50) return;
 
     const nextH = this.stitchCanvas.height + newH;
     if (nextH > this.LONG_MAX_STITCH_H) {
@@ -722,9 +750,10 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
     this.growStitchCanvas(nextH);
 
+    // append only new region
     this.stitchCtx.drawImage(
       this.longFrameCanvas,
-      0, newY, W, newH,
+      0, cutFromTop, W, newH,
       0, this.stitchCanvas.height - newH, W, newH
     );
 
@@ -761,9 +790,13 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     }
   }
 
-  private estimateVerticalShiftFast(prevCanvas: HTMLCanvasElement, currCanvas: HTMLCanvasElement): number {
+  // FIXED LONG MODE: return overlap cut line from TOP of curr
+  private estimateOverlapCutYFast(
+    prevCanvas: HTMLCanvasElement,
+    currCanvas: HTMLCanvasElement
+  ): { ok: boolean; cutY: number; score: number; hint?: string } {
     const cvAny: any = (window as any).cv;
-    if (!cvAny?.imread) return 0;
+    if (!cvAny?.imread) return { ok: false, cutY: 0, score: 0, hint: 'OpenCV not ready' };
 
     let prev: any, curr: any, pg: any, cg: any, res: any;
     try {
@@ -785,20 +818,23 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       const W = pSmall.cols;
       const H = pSmall.rows;
 
-      const stripW = Math.max(50, Math.floor(W * this.LONG_CENTER_STRIP_W_FRAC));
+      const stripW = Math.max(60, Math.floor(W * this.LONG_CENTER_STRIP_W_FRAC));
       const stripX = Math.max(0, Math.floor((W - stripW) / 2));
 
-      const stripH = Math.max(60, Math.floor(H * this.LONG_STRIP_H_FRAC));
-      const y0 = Math.max(0, H - stripH);
+      const stripH = Math.max(70, Math.floor(H * this.LONG_STRIP_H_FRAC));
+      const y0Prev = Math.max(0, H - stripH); // bottom strip of prev
 
-      const pRoi = pSmall.roi(new cvAny.Rect(stripX, y0, stripW, stripH));
+      // template = bottom strip of prev
+      const pRoi = pSmall.roi(new cvAny.Rect(stripX, y0Prev, stripW, stripH));
+
+      // search area = full height of curr (same width center)
       const cRoi = cSmall.roi(new cvAny.Rect(stripX, 0, stripW, H));
 
       const resultCols = cRoi.cols - pRoi.cols + 1; // should be 1
       const resultRows = cRoi.rows - pRoi.rows + 1;
       if (resultCols <= 0 || resultRows <= 0) {
         pRoi.delete(); cRoi.delete(); pSmall.delete(); cSmall.delete();
-        return 0;
+        return { ok: false, cutY: 0, score: 0, hint: 'Frame mismatch—try slower' };
       }
 
       res = new cvAny.Mat(resultRows, resultCols, cvAny.CV_32FC1);
@@ -806,14 +842,30 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
       const mm = cvAny.minMaxLoc(res);
       const bestY = mm.maxLoc.y;
+      const score = mm.maxVal;
 
-      const dySmall = y0 - bestY;
-      const dy = dySmall / scale;
+      // IMPORTANT: overlap ends at bestY + stripH in curr (small)
+      const cutSmall = bestY + stripH;
+      const cutY = Math.round(cutSmall / scale);
 
       pRoi.delete(); cRoi.delete(); pSmall.delete(); cSmall.delete();
-      return Math.max(0, Math.round(dy));
+
+      if (score < this.LONG_MIN_MATCH_SCORE) {
+        return {
+          ok: false,
+          cutY,
+          score,
+          hint: 'Can’t align—keep receipt centered & move DOWN slower…'
+        };
+      }
+
+      return {
+        ok: true,
+        cutY: Math.max(0, cutY),
+        score
+      };
     } catch {
-      return 0;
+      return { ok: false, cutY: 0, score: 0, hint: 'Matching failed—try again' };
     } finally {
       prev?.delete?.(); curr?.delete?.(); pg?.delete?.(); cg?.delete?.();
       res?.delete?.();
