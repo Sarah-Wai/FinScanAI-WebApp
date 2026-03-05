@@ -1,4 +1,4 @@
-// camera-scan.component.ts (UPDATED: split long receipts into segments + enhance)
+// camera-scan.component.ts (UPDATED: robust capture + long-receipt splitting)
 import { Component, ElementRef, ViewChild, AfterViewInit, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { Router } from '@angular/router';
@@ -51,13 +51,18 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
   showGrid = true;
 
-  canCapture = false;
+  canCapture = false; // now used only for UI hint (polygon color)
   cameraHint = 'Loading OpenCV...';
   private cvReady = false;
   private detectTimer?: number;
 
   private lastCorners: { x: number; y: number }[] | null = null;
   private stableCount = 0;
+
+  // cache last low-res detection so we can map to full-res
+  private lastWorkCorners: { x: number; y: number }[] | null = null;
+  private lastWorkW = 0;
+  private lastWorkH = 0;
 
   // Quality toggles (used by HTML ngModel)
   saveAsPng = false;
@@ -84,7 +89,6 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
   ngOnDestroy() {
     this.stopCamera();
-    // cleanup object urls
     this.receipts.forEach(r => URL.revokeObjectURL(r.url));
   }
 
@@ -125,7 +129,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     const constraints: MediaStreamConstraints = {
       video: {
         facingMode: this.usingFront ? 'user' : { ideal: 'environment' },
-        width: { ideal: 2560 },   // slightly higher ideal resolution
+        width: { ideal: 2560 },
         height: { ideal: 1440 },
         frameRate: { ideal: 30, max: 30 },
       } as any,
@@ -134,13 +138,12 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
     this.stream = await navigator.mediaDevices.getUserMedia(constraints);
 
-    // optional: try continuous focus/exposure (may be ignored on iOS)
     try {
       const track = this.stream.getVideoTracks?.()[0];
       await track?.applyConstraints?.({
         advanced: [{ focusMode: 'continuous', exposureMode: 'continuous', whiteBalanceMode: 'continuous' }]
       } as any);
-      console.log('iOS camera settings:', track?.getSettings?.());
+      console.log('camera settings:', track?.getSettings?.());
     } catch {}
 
     const video = this.videoRef.nativeElement;
@@ -170,6 +173,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     this.canCapture = false;
     this.lastCorners = null;
     this.stableCount = 0;
+    this.lastWorkCorners = null;
     this.clearOverlay();
   }
 
@@ -228,10 +232,17 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     const corners = this.findReceiptCornersOnCanvas(work);
     const areaFrac = corners ? this.polyAreaFrac(corners) : 0;
 
-    const ok = this.updateStability(corners, areaFrac);
-    this.canCapture = ok;
+    // cache low-res corners for later mapping
+    if (corners) {
+      this.lastWorkCorners = corners;
+      this.lastWorkW = W;
+      this.lastWorkH = H;
+    }
 
-    const MIN_AREA_FRAC = 0.40;
+    const ok = this.updateStability(corners, areaFrac);
+    this.canCapture = ok; // only affects overlay color
+
+    const MIN_AREA_FRAC = 0.20;
 
     if (!corners) {
       this.cameraHint = 'Point camera at receipt';
@@ -242,7 +253,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     } else if (this.receipts.length >= this.MAX_RECEIPTS) {
       this.cameraHint = `Limit reached (${this.MAX_RECEIPTS}). Process or clear.`;
     } else {
-      this.cameraHint = 'Ready — tap Capture';
+      this.cameraHint = 'Looks good — you can Capture.';
     }
 
     this.drawOverlayCorners(corners, W, H);
@@ -252,7 +263,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     corners: { x: number; y: number }[] | null,
     areaFrac: number
   ): boolean {
-    const MIN_AREA_FRAC = 0.40;
+    const MIN_AREA_FRAC = 0.20;
 
     if (!corners || corners.length !== 4) {
       this.lastCorners = null;
@@ -260,7 +271,6 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       return false;
     }
 
-    // Gate: require receipt to be large enough in frame (quality)
     if (areaFrac < MIN_AREA_FRAC) {
       this.lastCorners = null;
       this.stableCount = 0;
@@ -279,7 +289,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     if (avgMove < 4) this.stableCount++;
     else this.stableCount = 0;
 
-    return this.stableCount >= 6;
+    return this.stableCount >= 3;
   }
 
   private avgCornerMove(a: {x:number;y:number}[], b: {x:number;y:number}[]) {
@@ -446,8 +456,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   }
 
   // ============================
-  // Capture + warp -> add to batch (max 10)
-  // with long-receipt splitting
+  // Capture + warp (if possible) + split
   // ============================
   captureWarped() {
     if (this.receipts.length >= this.MAX_RECEIPTS) {
@@ -467,62 +476,47 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
 
+    // 1) Grab the current frame
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-    // detect corners again on full-res
-    const corners = this.findReceiptCornersOnCanvas(canvas);
-    if (!corners) {
-      this.cameraHint = 'Could not find corners on capture. Try again.';
-      return;
+    // 2) Try to detect corners on full-res
+    let corners = this.findReceiptCornersOnCanvas(canvas);
+
+    // 3) If that fails, map the last low-res corners to full-res
+    if (!corners && this.lastWorkCorners && this.lastWorkW > 0 && this.lastWorkH > 0) {
+      const scaleX = canvas.width / this.lastWorkW;
+      const scaleY = canvas.height / this.lastWorkH;
+      corners = this.lastWorkCorners.map(p => ({
+        x: p.x * scaleX,
+        y: p.y * scaleY,
+      }));
+      console.log('Using mapped low-res corners for capture:', corners);
     }
 
-    const warpedCanvas = this.warpCanvasByCorners(canvas, corners);
+    // 4) Try to warp by corners; fall back to full frame if not reliable
+    let warpedCanvas: HTMLCanvasElement | null = null;
+
+    if (corners) {
+      warpedCanvas = this.warpCanvasByCorners(canvas, corners);
+    }
+
     if (!warpedCanvas) {
-      this.cameraHint = 'Warp failed. Try again.';
-      return;
+      this.cameraHint = 'Corners not reliable; using full frame.';
+      warpedCanvas = document.createElement('canvas');
+      warpedCanvas.width = canvas.width;
+      warpedCanvas.height = canvas.height;
+      const wctx = warpedCanvas.getContext('2d');
+      if (!wctx) return;
+      wctx.drawImage(canvas, 0, 0);
     }
 
-    // ---- NEW: detect tall receipts and split into segments ----
-    const MAX_SINGLE_AR = 4.0; // treat >4:1 as "very long"
-    const ar = warpedCanvas.height / warpedCanvas.width;
-
-    const mime = this.saveAsPng ? 'image/png' : 'image/jpeg';
-    const quality = this.saveAsPng ? undefined : 0.95;
-
-    let segmentCanvases: HTMLCanvasElement[];
-
-    if (ar > MAX_SINGLE_AR) {
-      segmentCanvases = this.splitTallReceipt(warpedCanvas, 1800);
-      this.cameraHint = `Very long receipt detected — split into ${segmentCanvases.length} part(s).`;
-    } else {
-      segmentCanvases = [warpedCanvas];
-    }
-
-    // Respect remaining capacity
-    const remainingSlots = this.MAX_RECEIPTS - this.receipts.length;
-    if (segmentCanvases.length > remainingSlots) {
-      segmentCanvases = segmentCanvases.slice(0, remainingSlots);
-      this.limitMsg = `Added only ${remainingSlots} segment(s). Max ${this.MAX_RECEIPTS} receipts per batch.`;
-    }
-
-    const partCount = segmentCanvases.length;
-
-    segmentCanvases.forEach((seg, idx) => {
-      // Optional: enhance via OpenCV
-      this.enhanceReceiptCanvas(seg);
-
-      // Optional: additional sharpen at lower amount
-      if (this.sharpenAfterWarp) this.sharpenCanvas(seg, 0.15);
-
-      seg.toBlob((blob: Blob | null) => {
-        if (!blob) return;
-        this.addReceipt(blob, 'camera', idx + 1, partCount);
-      }, mime as any, quality as any);
-    });
+    // 5) Post-process + split + add to batch
+    this.postProcessAndAdd(warpedCanvas, 'camera');
   }
 
   private warpCanvasByCorners(canvasEl: HTMLCanvasElement, corners: {x:number;y:number}[]) {
     const cvAny: any = (window as any).cv;
+    if (!cvAny?.imread) return null;
 
     let src: any, dst: any, M: any, srcTri: any, dstTri: any;
     try {
@@ -538,7 +532,6 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       let maxW = Math.min(3200, Math.max(1, Math.round(Math.max(widthA, widthB) * upscale)));
       let maxH = Math.min(7000, Math.max(1, Math.round(Math.max(heightA, heightB) * upscale)));
 
-      // clamp aspect ratio to avoid absurdly tall single images
       const MAX_AR = 5.0;
       const ar = maxH / maxW;
       if (ar > MAX_AR) {
@@ -562,7 +555,8 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       cvAny.imshow(out, dst);
 
       return out;
-    } catch {
+    } catch (e) {
+      console.warn('warpCanvasByCorners failed', e);
       return null;
     } finally {
       src?.delete?.();
@@ -571,6 +565,46 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       srcTri?.delete?.();
       dstTri?.delete?.();
     }
+  }
+
+  private postProcessAndAdd(
+    baseCanvas: HTMLCanvasElement,
+    source: 'camera' | 'upload'
+  ) {
+    const mime = this.saveAsPng ? 'image/png' : 'image/jpeg';
+    const quality = this.saveAsPng ? undefined : 0.95;
+
+    const MAX_SINGLE_AR = 4.0;
+    const ar = baseCanvas.height / baseCanvas.width;
+
+    let segmentCanvases: HTMLCanvasElement[];
+
+    if (ar > MAX_SINGLE_AR) {
+      segmentCanvases = this.splitTallReceipt(baseCanvas, 1800);
+      this.cameraHint = `Very long receipt detected — split into ${segmentCanvases.length} part(s).`;
+    } else {
+      segmentCanvases = [baseCanvas];
+    }
+
+    const remainingSlots = this.MAX_RECEIPTS - this.receipts.length;
+    if (segmentCanvases.length > remainingSlots) {
+      segmentCanvases = segmentCanvases.slice(0, remainingSlots);
+      this.limitMsg = `Added only ${remainingSlots} segment(s). Max ${this.MAX_RECEIPTS} receipts per batch.`;
+    }
+
+    const partCount = segmentCanvases.length;
+
+    segmentCanvases.forEach((seg, idx) => {
+      this.enhanceReceiptCanvas(seg);
+      if (this.sharpenAfterWarp) this.sharpenCanvas(seg, 0.15);
+
+      seg.toBlob((blob: Blob | null) => {
+        if (!blob) return;
+        const pi = partCount > 1 ? idx + 1 : undefined;
+        const pc = partCount > 1 ? partCount : undefined;
+        this.addReceipt(blob, source, pi, pc);
+      }, mime as any, quality as any);
+    });
   }
 
   private sharpenCanvas(c: HTMLCanvasElement, amount = 0.25) {
@@ -603,7 +637,6 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     ctx.putImageData(img, 0, 0);
   }
 
-  // Enhance using OpenCV: grayscale + denoise + CLAHE
   private enhanceReceiptCanvas(c: HTMLCanvasElement) {
     const cvAny: any = (window as any).cv;
     if (!cvAny?.imread) return;
@@ -637,7 +670,6 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     }
   }
 
-  // Split tall warped receipt into multiple canvases
   private splitTallReceipt(
     warped: HTMLCanvasElement,
     maxSegmentHeight = 1800
@@ -733,8 +765,6 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     };
 
     this.receipts.unshift(item);
-
-    // auto select newest
     this.selectReceipt(id);
     return true;
   }
@@ -776,7 +806,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   }
 
   // ============================
-  // Use selected + save debug (selected)
+  // Use selected + save debug
   // ============================
   useSelected() {
     if (!this.selectedBlob) return;
@@ -811,8 +841,6 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   // Backend upload (stub)
   // ============================
   async processAll() {
-    // later: send this.receipts blobs via FormData to Python backend
-    // For now: store small metadata for navigation
     this.uploadMsg = `Ready to send ${this.receipts.length} receipt(s) to backend.`;
   }
 
