@@ -1,4 +1,4 @@
-// camera-scan.component.ts (FULL UPDATED: stable green + robust long receipt splitting)
+// camera-scan.component.ts (FULL UPDATED: stable green + Long Receipt Mode (guided vertical stitch))
 import { Component, ElementRef, ViewChild, AfterViewInit, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { Router } from '@angular/router';
@@ -12,8 +12,6 @@ type ReceiptShot = {
   url: string;
   source: 'camera' | 'upload';
   createdAt: number;
-  partIndex?: number;   // 1-based segment index for long receipts
-  partCount?: number;   // total segments for that long receipt
 };
 
 @Component({
@@ -25,9 +23,9 @@ type ReceiptShot = {
 })
 export class CameraScanComponent implements AfterViewInit, OnDestroy {
   @ViewChild('video') videoRef!: ElementRef<HTMLVideoElement>;
-  @ViewChild('canvas') canvasRef!: ElementRef<HTMLCanvasElement>;   // full-res capture canvas
-  @ViewChild('work') workRef!: ElementRef<HTMLCanvasElement>;       // small detection canvas
-  @ViewChild('overlay') overlayRef!: ElementRef<HTMLCanvasElement>; // overlay drawing
+  @ViewChild('canvas') canvasRef!: ElementRef<HTMLCanvasElement>;
+  @ViewChild('work') workRef!: ElementRef<HTMLCanvasElement>;
+  @ViewChild('overlay') overlayRef!: ElementRef<HTMLCanvasElement>;
 
   // ============================
   // Batch / multi receipts
@@ -51,7 +49,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
   showGrid = true;
 
-  canCapture = false; // used for UI hint (polygon color)
+  canCapture = false;
   cameraHint = 'Loading OpenCV...';
   private cvReady = false;
   private detectTimer?: number;
@@ -67,6 +65,25 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   // Quality toggles (used by HTML ngModel)
   saveAsPng = false;
   sharpenAfterWarp = true;
+
+  // ============================
+  // Long Receipt Mode (guided stitch)
+  // ============================
+  isLongMode = false;
+  private longTimer?: number;
+
+  private stitchCanvas?: HTMLCanvasElement;
+  private stitchCtx?: CanvasRenderingContext2D | null;
+
+  private lastAcceptedFrame?: HTMLCanvasElement;
+  private noNewCount = 0;
+
+  private readonly LONG_CAPTURE_MS = 280;
+  private readonly LONG_FRAME_W = 900;        // 720~1080 recommended
+  private readonly LONG_MAX_STITCH_H = 14000; // prevent memory crash
+  private readonly LONG_BLUR_MIN = 70;        // tune per device
+  private readonly LONG_MIN_DY = 70;          // minimal movement to accept new content
+  private readonly LONG_STOP_NO_NEW = 10;     // stop after N duplicate frames
 
   constructor(private router: Router) {}
 
@@ -88,6 +105,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   }
 
   ngOnDestroy() {
+    this.stopLongReceipt(false);
     this.stopCamera();
     this.receipts.forEach(r => URL.revokeObjectURL(r.url));
   }
@@ -124,6 +142,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   // Camera start/stop
   // ============================
   async startCamera() {
+    this.stopLongReceipt(false);
     this.stopCamera();
 
     const constraints: MediaStreamConstraints = {
@@ -214,13 +233,13 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
   private detectOnce() {
     if (!this.cvReady) return;
+    if (this.isLongMode) return;
 
     const video = this.videoRef.nativeElement;
     if (!video.videoWidth || !video.videoHeight) return;
 
     const work = this.workRef.nativeElement;
 
-    // low-res work canvas (fast + stable)
     const W = 420;
     const H = Math.round((video.videoHeight / video.videoWidth) * W);
     work.width = W;
@@ -234,12 +253,8 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     let corners = this.findReceiptCornersOnCanvas(work);
     const areaFrac = corners ? this.polyAreaFrac(corners) : 0;
 
-    // smoothing reduces jitter
-    if (corners) {
-      corners = this.smoothCorners(this.lastCorners, corners, 0.7);
-    }
+    if (corners) corners = this.smoothCorners(this.lastCorners, corners, 0.7);
 
-    // cache low-res corners for capture mapping
     if (corners) {
       this.lastWorkCorners = corners;
       this.lastWorkW = W;
@@ -247,7 +262,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     }
 
     const ok = this.updateStability(corners, areaFrac);
-    this.canCapture = ok; // affects overlay color + Capture button
+    this.canCapture = ok;
 
     const MIN_AREA_FRAC_HINT = 0.12;
 
@@ -270,7 +285,6 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     corners: { x: number; y: number }[] | null,
     areaFrac: number
   ): boolean {
-    // easier to pass + more realistic
     const MIN_AREA_FRAC = 0.12;
     const NEED_STABLE = 2;
 
@@ -289,9 +303,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     const avgMove = this.avgCornerMove(this.lastCorners, corners);
     this.lastCorners = corners;
 
-    // relative threshold (work canvas ~420 wide)
-    const moveThresh = Math.max(3, Math.min(9, this.lastWorkW * 0.012)); // ~5px typical
-
+    const moveThresh = Math.max(3, Math.min(9, this.lastWorkW * 0.012));
     if (avgMove < moveThresh) this.stableCount++;
     else this.stableCount = 0;
 
@@ -417,7 +429,6 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       edges = new cvAny.Mat();
       cvAny.Canny(blur, edges, 50, 150);
 
-      // connect broken edges slightly (reduces jitter)
       const kernel = cvAny.getStructuringElement(cvAny.MORPH_RECT, new cvAny.Size(3, 3));
       cvAny.morphologyEx(edges, edges, cvAny.MORPH_CLOSE, kernel);
       kernel.delete();
@@ -466,7 +477,6 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     }
   }
 
-  // IMPORTANT FIX: TR/BL diff sign was swapped before
   private orderCorners(pts: {x:number;y:number}[]) {
     const sum = pts.map(p => p.x + p.y);
     const diff = pts.map(p => p.x - p.y);
@@ -481,7 +491,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   }
 
   // ============================
-  // Capture + warp (if possible) + split
+  // Capture + warp (single shot)
   // ============================
   captureWarped() {
     if (this.receipts.length >= this.MAX_RECEIPTS) {
@@ -501,29 +511,18 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
 
-    // 1) Grab the current frame
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-    // 2) Try to detect corners on full-res
     let corners = this.findReceiptCornersOnCanvas(canvas);
 
-    // 3) If that fails, map the last low-res corners to full-res
     if (!corners && this.lastWorkCorners && this.lastWorkW > 0 && this.lastWorkH > 0) {
       const scaleX = canvas.width / this.lastWorkW;
       const scaleY = canvas.height / this.lastWorkH;
-      corners = this.lastWorkCorners.map(p => ({
-        x: p.x * scaleX,
-        y: p.y * scaleY,
-      }));
-      console.log('Using mapped low-res corners for capture:', corners);
+      corners = this.lastWorkCorners.map(p => ({ x: p.x * scaleX, y: p.y * scaleY }));
     }
 
-    // 4) Try to warp by corners; fall back to full frame if not reliable
     let warpedCanvas: HTMLCanvasElement | null = null;
-
-    if (corners) {
-      warpedCanvas = this.warpCanvasByCorners(canvas, corners);
-    }
+    if (corners) warpedCanvas = this.warpCanvasByCorners(canvas, corners);
 
     if (!warpedCanvas) {
       this.cameraHint = 'Corners not reliable; using full frame.';
@@ -535,8 +534,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       wctx.drawImage(canvas, 0, 0);
     }
 
-    // 5) Post-process + split + add to batch
-    this.postProcessAndAdd(warpedCanvas, 'camera');
+    this.postProcessAndAddSingle(warpedCanvas, 'camera');
   }
 
   private warpCanvasByCorners(canvasEl: HTMLCanvasElement, corners: {x:number;y:number}[]) {
@@ -555,13 +553,11 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
       const upscale = 1.8;
       let maxW = Math.min(3200, Math.max(1, Math.round(Math.max(widthA, widthB) * upscale)));
-      let maxH = Math.min(7000, Math.max(1, Math.round(Math.max(heightA, heightB) * upscale)));
+      let maxH = Math.min(9000, Math.max(1, Math.round(Math.max(heightA, heightB) * upscale)));
 
-      const MAX_AR = 5.0;
+      const MAX_AR = 7.0;
       const ar = maxH / maxW;
-      if (ar > MAX_AR) {
-        maxH = Math.round(maxW * MAX_AR);
-      }
+      if (ar > MAX_AR) maxH = Math.round(maxW * MAX_AR);
 
       srcTri = cvAny.matFromArray(4, 1, cvAny.CV_32FC2, [
         tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y
@@ -578,90 +574,240 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       out.width = maxW;
       out.height = maxH;
       cvAny.imshow(out, dst);
-
       return out;
     } catch (e) {
       console.warn('warpCanvasByCorners failed', e);
       return null;
     } finally {
-      src?.delete?.();
-      dst?.delete?.();
-      M?.delete?.();
-      srcTri?.delete?.();
-      dstTri?.delete?.();
+      src?.delete?.(); dst?.delete?.(); M?.delete?.(); srcTri?.delete?.(); dstTri?.delete?.();
     }
   }
 
-  private postProcessAndAdd(
+  // ============================
+  // Long Receipt Mode
+  // ============================
+  startLongReceipt() {
+    if (!this.cvReady) return;
+    if (this.isLongMode) return;
+
+    if (this.receipts.length >= this.MAX_RECEIPTS) {
+      this.limitMsg = `Max ${this.MAX_RECEIPTS} receipts per batch.`;
+      return;
+    }
+
+    this.isLongMode = true;
+    this.limitMsg = '';
+    this.uploadMsg = '';
+    this.noNewCount = 0;
+    this.lastAcceptedFrame = undefined;
+
+    this.stitchCanvas = document.createElement('canvas');
+    this.stitchCanvas.width = 0;
+    this.stitchCanvas.height = 0;
+    this.stitchCtx = this.stitchCanvas.getContext('2d');
+
+    this.cameraHint = 'Long mode: start at TOP, move DOWN slowly…';
+
+    this.longTimer = window.setInterval(() => this.captureLongFrame(), this.LONG_CAPTURE_MS);
+  }
+
+  stopLongReceipt(save: boolean) {
+    if (this.longTimer) {
+      clearInterval(this.longTimer);
+      this.longTimer = undefined;
+    }
+
+    const wasLong = this.isLongMode;
+    this.isLongMode = false;
+
+    if (!save || !wasLong) {
+      return;
+    }
+
+    if (!this.stitchCanvas || !this.stitchCtx || this.stitchCanvas.height < 200) {
+      this.cameraHint = 'Long mode: not enough captured. Try again slower.';
+      return;
+    }
+
+    this.postProcessAndAddSingle(this.stitchCanvas, 'camera');
+    this.cameraHint = 'Saved long receipt as one image.';
+  }
+
+  private captureLongFrame() {
+    const video = this.videoRef.nativeElement;
+    if (!video.videoWidth || !video.videoHeight) return;
+
+    const frame = document.createElement('canvas');
+    const W = this.LONG_FRAME_W;
+    const H = Math.round((video.videoHeight / video.videoWidth) * W);
+    frame.width = W;
+    frame.height = H;
+
+    const fctx = frame.getContext('2d', { willReadFrequently: true });
+    if (!fctx) return;
+
+    fctx.drawImage(video, 0, 0, W, H);
+
+    const blur = this.blurScore(frame);
+    if (blur < this.LONG_BLUR_MIN) {
+      this.cameraHint = 'Too blurry—hold steadier / more light…';
+      return;
+    }
+
+    if (!this.lastAcceptedFrame) {
+      this.ensureStitchCanvas(W, Math.min(H, this.LONG_MAX_STITCH_H));
+      this.stitchCtx!.drawImage(frame, 0, 0);
+      this.lastAcceptedFrame = frame;
+      this.cameraHint = 'Good. Now move DOWN slowly…';
+      return;
+    }
+
+    const dy = this.estimateVerticalShift(this.lastAcceptedFrame, frame);
+
+    if (dy < this.LONG_MIN_DY) {
+      this.noNewCount++;
+      this.cameraHint = 'Move down a bit…';
+      if (this.noNewCount >= this.LONG_STOP_NO_NEW) {
+        this.cameraHint = 'No new content detected—auto saving.';
+        this.stopLongReceipt(true);
+      }
+      return;
+    }
+
+    this.noNewCount = 0;
+
+    const newY = dy;
+    const newH = frame.height - newY;
+    if (newH <= 50) return;
+
+    const nextH = (this.stitchCanvas!.height + newH);
+    if (nextH > this.LONG_MAX_STITCH_H) {
+      this.cameraHint = 'Reached max length—saving.';
+      this.stopLongReceipt(true);
+      return;
+    }
+
+    this.growStitchCanvas(nextH);
+
+    this.stitchCtx!.drawImage(
+      frame,
+      0, newY, frame.width, newH,
+      0, this.stitchCanvas!.height - newH, frame.width, newH
+    );
+
+    this.lastAcceptedFrame = frame;
+    this.cameraHint = `Capturing… (+${newH}px)`;
+  }
+
+  private blurScore(canvasEl: HTMLCanvasElement): number {
+    const cvAny: any = (window as any).cv;
+    if (!cvAny?.imread) return 0;
+
+    let src: any, gray: any, lap: any, mean: any, std: any;
+    try {
+      src = cvAny.imread(canvasEl);
+      gray = new cvAny.Mat();
+      cvAny.cvtColor(src, gray, cvAny.COLOR_RGBA2GRAY);
+
+      lap = new cvAny.Mat();
+      cvAny.Laplacian(gray, lap, cvAny.CV_64F);
+
+      mean = new cvAny.Mat();
+      std = new cvAny.Mat();
+      cvAny.meanStdDev(lap, mean, std);
+
+      const s = std.data64F[0];
+      return s * s;
+    } catch {
+      return 0;
+    } finally {
+      src?.delete?.(); gray?.delete?.(); lap?.delete?.(); mean?.delete?.(); std?.delete?.();
+    }
+  }
+
+  private estimateVerticalShift(prevCanvas: HTMLCanvasElement, currCanvas: HTMLCanvasElement): number {
+    const cvAny: any = (window as any).cv;
+    if (!cvAny?.imread) return 0;
+
+    let prev: any, curr: any, pg: any, cg: any, templ: any, res: any;
+    try {
+      prev = cvAny.imread(prevCanvas);
+      curr = cvAny.imread(currCanvas);
+
+      pg = new cvAny.Mat(); cg = new cvAny.Mat();
+      cvAny.cvtColor(prev, pg, cvAny.COLOR_RGBA2GRAY);
+      cvAny.cvtColor(curr, cg, cvAny.COLOR_RGBA2GRAY);
+
+      const stripH = Math.max(80, Math.floor(prevCanvas.height * 0.22));
+      const y0 = prevCanvas.height - stripH;
+
+      templ = pg.roi(new cvAny.Rect(0, y0, prevCanvas.width, stripH));
+
+      const resultCols = cg.cols - templ.cols + 1;
+      const resultRows = cg.rows - templ.rows + 1;
+      if (resultCols <= 0 || resultRows <= 0) return 0;
+
+      res = new cvAny.Mat(resultRows, resultCols, cvAny.CV_32FC1);
+      cvAny.matchTemplate(cg, templ, res, cvAny.TM_CCOEFF_NORMED);
+
+      const mm = cvAny.minMaxLoc(res);
+      const bestY = mm.maxLoc.y;
+
+      const dy = y0 - bestY;
+      return Math.max(0, Math.round(dy));
+    } catch {
+      return 0;
+    } finally {
+      prev?.delete?.(); curr?.delete?.(); pg?.delete?.(); cg?.delete?.();
+      templ?.delete?.(); res?.delete?.();
+    }
+  }
+
+  private ensureStitchCanvas(w: number, h: number) {
+    if (!this.stitchCanvas || !this.stitchCtx) return;
+    this.stitchCanvas.width = w;
+    this.stitchCanvas.height = h;
+  }
+
+  private growStitchCanvas(newH: number) {
+    if (!this.stitchCanvas) return;
+
+    const old = this.stitchCanvas;
+    const tmp = document.createElement('canvas');
+    tmp.width = old.width;
+    tmp.height = newH;
+
+    const tctx = tmp.getContext('2d');
+    if (!tctx) return;
+
+    tctx.drawImage(old, 0, 0);
+
+    this.stitchCanvas = tmp;
+    this.stitchCtx = tctx;
+  }
+
+  // ============================
+  // Post-process + add (SINGLE image only)
+  // ============================
+  private postProcessAndAddSingle(
     baseCanvas: HTMLCanvasElement,
     source: 'camera' | 'upload'
   ) {
     const mime = this.saveAsPng ? 'image/png' : 'image/jpeg';
     const quality = this.saveAsPng ? undefined : 0.95;
 
-    const MAX_SINGLE_AR = 4.0;
-    const ar = baseCanvas.height / baseCanvas.width;
+    this.enhanceReceiptCanvas(baseCanvas);
+    if (this.sharpenAfterWarp) this.sharpenCanvas(baseCanvas, 0.15);
 
-    let segmentCanvases: HTMLCanvasElement[];
-
-    if (ar > MAX_SINGLE_AR) {
-      segmentCanvases = this.splitTallReceipt(baseCanvas, 1800);
-      this.cameraHint = `Very long receipt detected — split into ${segmentCanvases.length} part(s).`;
-    } else {
-      segmentCanvases = [baseCanvas];
-    }
-
-    const remainingSlots = this.MAX_RECEIPTS - this.receipts.length;
-    if (segmentCanvases.length > remainingSlots) {
-      segmentCanvases = segmentCanvases.slice(0, remainingSlots);
-      this.limitMsg = `Added only ${remainingSlots} segment(s). Max ${this.MAX_RECEIPTS} receipts per batch.`;
-    }
-
-    const partCount = segmentCanvases.length;
-
-    segmentCanvases.forEach((seg, idx) => {
-      this.enhanceReceiptCanvas(seg);
-      if (this.sharpenAfterWarp) this.sharpenCanvas(seg, 0.15);
-
-      seg.toBlob((blob: Blob | null) => {
-        if (!blob) return;
-        const pi = partCount > 1 ? idx + 1 : undefined;
-        const pc = partCount > 1 ? partCount : undefined;
-        this.addReceipt(blob, source, pi, pc);
-      }, mime as any, quality as any);
-    });
+    baseCanvas.toBlob((blob: Blob | null) => {
+      if (!blob) return;
+      this.addReceipt(blob, source);
+    }, mime as any, quality as any);
   }
 
-  private sharpenCanvas(c: HTMLCanvasElement, amount = 0.25) {
-    const ctx = c.getContext('2d', { willReadFrequently: true });
-    if (!ctx) return;
-
-    const img = ctx.getImageData(0, 0, c.width, c.height);
-    const data = img.data;
-    const w = c.width;
-    const h = c.height;
-
-    const copy = new Uint8ClampedArray(data);
-    const idx = (x:number,y:number)=> (y*w + x) * 4;
-
-    for (let y = 1; y < h - 1; y++) {
-      for (let x = 1; x < w - 1; x++) {
-        const i = idx(x, y);
-        for (let ch = 0; ch < 3; ch++) {
-          const center = copy[i + ch];
-          const v =
-            5 * center
-            - copy[idx(x - 1, y) + ch] - copy[idx(x + 1, y) + ch]
-            - copy[idx(x, y - 1) + ch] - copy[idx(x, y + 1) + ch];
-
-          const out = center + amount * (v - center);
-          data[i + ch] = Math.max(0, Math.min(255, out));
-        }
-      }
-    }
-    ctx.putImageData(img, 0, 0);
-  }
-
+  // ============================
+  // Enhance + sharpen (OCR)
+  // ============================
   private enhanceReceiptCanvas(c: HTMLCanvasElement) {
     const cvAny: any = (window as any).cv;
     if (!cvAny?.imread) return;
@@ -695,40 +841,34 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     }
   }
 
-  private splitTallReceipt(
-    warped: HTMLCanvasElement,
-    maxSegmentHeight = 1800
-  ): HTMLCanvasElement[] {
-    const segments: HTMLCanvasElement[] = [];
-    const totalHeight = warped.height;
+  private sharpenCanvas(c: HTMLCanvasElement, amount = 0.25) {
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return;
 
-    if (totalHeight <= maxSegmentHeight) {
-      return [warped];
+    const img = ctx.getImageData(0, 0, c.width, c.height);
+    const data = img.data;
+    const w = c.width;
+    const h = c.height;
+
+    const copy = new Uint8ClampedArray(data);
+    const idx = (x:number,y:number)=> (y*w + x) * 4;
+
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const i = idx(x, y);
+        for (let ch = 0; ch < 3; ch++) {
+          const center = copy[i + ch];
+          const v =
+            5 * center
+            - copy[idx(x - 1, y) + ch] - copy[idx(x + 1, y) + ch]
+            - copy[idx(x, y - 1) + ch] - copy[idx(x, y + 1) + ch];
+
+          const out = center + amount * (v - center);
+          data[i + ch] = Math.max(0, Math.min(255, out));
+        }
+      }
     }
-
-    const numSegments = Math.ceil(totalHeight / maxSegmentHeight);
-
-    for (let i = 0; i < numSegments; i++) {
-      const startY = i * maxSegmentHeight;
-      const segH = Math.min(maxSegmentHeight, totalHeight - startY);
-
-      const segCanvas = document.createElement('canvas');
-      segCanvas.width = warped.width;
-      segCanvas.height = segH;
-
-      const ctx = segCanvas.getContext('2d');
-      if (!ctx) continue;
-
-      ctx.drawImage(
-        warped,
-        0, startY, warped.width, segH,
-        0, 0, warped.width, segH
-      );
-
-      segments.push(segCanvas);
-    }
-
-    return segments;
+    ctx.putImageData(img, 0, 0);
   }
 
   // ============================
@@ -766,9 +906,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
   private addReceipt(
     blob: Blob,
-    source: 'camera' | 'upload',
-    partIndex?: number,
-    partCount?: number
+    source: 'camera' | 'upload'
   ) {
     if (this.receipts.length >= this.MAX_RECEIPTS) {
       this.limitMsg = `Max ${this.MAX_RECEIPTS} receipts per batch. Process or clear first.`;
@@ -785,8 +923,6 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       url,
       source,
       createdAt: Date.now(),
-      partIndex,
-      partCount,
     };
 
     this.receipts.unshift(item);
