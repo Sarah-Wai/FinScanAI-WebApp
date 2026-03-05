@@ -1,4 +1,4 @@
-// camera-scan.component.ts (UPDATED: robust capture + long-receipt splitting)
+// camera-scan.component.ts (FULL UPDATED: stable green + robust long receipt splitting)
 import { Component, ElementRef, ViewChild, AfterViewInit, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { Router } from '@angular/router';
@@ -51,7 +51,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
   showGrid = true;
 
-  canCapture = false; // now used only for UI hint (polygon color)
+  canCapture = false; // used for UI hint (polygon color)
   cameraHint = 'Loading OpenCV...';
   private cvReady = false;
   private detectTimer?: number;
@@ -219,7 +219,9 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     if (!video.videoWidth || !video.videoHeight) return;
 
     const work = this.workRef.nativeElement;
-    const W = 360;
+
+    // low-res work canvas (fast + stable)
+    const W = 420;
     const H = Math.round((video.videoHeight / video.videoWidth) * W);
     work.width = W;
     work.height = H;
@@ -229,10 +231,15 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
     ctx.drawImage(video, 0, 0, W, H);
 
-    const corners = this.findReceiptCornersOnCanvas(work);
+    let corners = this.findReceiptCornersOnCanvas(work);
     const areaFrac = corners ? this.polyAreaFrac(corners) : 0;
 
-    // cache low-res corners for later mapping
+    // smoothing reduces jitter
+    if (corners) {
+      corners = this.smoothCorners(this.lastCorners, corners, 0.7);
+    }
+
+    // cache low-res corners for capture mapping
     if (corners) {
       this.lastWorkCorners = corners;
       this.lastWorkW = W;
@@ -240,13 +247,13 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     }
 
     const ok = this.updateStability(corners, areaFrac);
-    this.canCapture = ok; // only affects overlay color
+    this.canCapture = ok; // affects overlay color + Capture button
 
-    const MIN_AREA_FRAC = 0.20;
+    const MIN_AREA_FRAC_HINT = 0.12;
 
     if (!corners) {
       this.cameraHint = 'Point camera at receipt';
-    } else if (areaFrac < MIN_AREA_FRAC) {
+    } else if (areaFrac < MIN_AREA_FRAC_HINT) {
       this.cameraHint = 'Move closer — receipt too small';
     } else if (!ok) {
       this.cameraHint = 'Hold steady…';
@@ -263,15 +270,11 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     corners: { x: number; y: number }[] | null,
     areaFrac: number
   ): boolean {
-    const MIN_AREA_FRAC = 0.20;
+    // easier to pass + more realistic
+    const MIN_AREA_FRAC = 0.12;
+    const NEED_STABLE = 2;
 
-    if (!corners || corners.length !== 4) {
-      this.lastCorners = null;
-      this.stableCount = 0;
-      return false;
-    }
-
-    if (areaFrac < MIN_AREA_FRAC) {
+    if (!corners || corners.length !== 4 || areaFrac < MIN_AREA_FRAC) {
       this.lastCorners = null;
       this.stableCount = 0;
       return false;
@@ -286,10 +289,13 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     const avgMove = this.avgCornerMove(this.lastCorners, corners);
     this.lastCorners = corners;
 
-    if (avgMove < 4) this.stableCount++;
+    // relative threshold (work canvas ~420 wide)
+    const moveThresh = Math.max(3, Math.min(9, this.lastWorkW * 0.012)); // ~5px typical
+
+    if (avgMove < moveThresh) this.stableCount++;
     else this.stableCount = 0;
 
-    return this.stableCount >= 3;
+    return this.stableCount >= NEED_STABLE;
   }
 
   private avgCornerMove(a: {x:number;y:number}[], b: {x:number;y:number}[]) {
@@ -309,6 +315,18 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     const work = this.workRef.nativeElement;
     const denom = work.width * work.height;
     return denom > 0 ? a / denom : 0;
+  }
+
+  private smoothCorners(
+    prev: {x:number;y:number}[] | null,
+    next: {x:number;y:number}[],
+    alpha = 0.7
+  ) {
+    if (!prev) return next;
+    return next.map((p, i) => ({
+      x: alpha * prev[i].x + (1 - alpha) * p.x,
+      y: alpha * prev[i].y + (1 - alpha) * p.y,
+    }));
   }
 
   private clearOverlay() {
@@ -399,6 +417,11 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       edges = new cvAny.Mat();
       cvAny.Canny(blur, edges, 50, 150);
 
+      // connect broken edges slightly (reduces jitter)
+      const kernel = cvAny.getStructuringElement(cvAny.MORPH_RECT, new cvAny.Size(3, 3));
+      cvAny.morphologyEx(edges, edges, cvAny.MORPH_CLOSE, kernel);
+      kernel.delete();
+
       contours = new cvAny.MatVector();
       hierarchy = new cvAny.Mat();
       cvAny.findContours(edges, contours, hierarchy, cvAny.RETR_EXTERNAL, cvAny.CHAIN_APPROX_SIMPLE);
@@ -415,7 +438,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
         const approx = new cvAny.Mat();
         cvAny.approxPolyDP(cnt, approx, 0.02 * peri, true);
 
-        if (approx.rows === 4) {
+        if (approx.rows === 4 && cvAny.isContourConvex(approx)) {
           bestArea = area;
           const pts: {x:number;y:number}[] = [];
           for (let r = 0; r < 4; r++) {
@@ -443,14 +466,16 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     }
   }
 
+  // IMPORTANT FIX: TR/BL diff sign was swapped before
   private orderCorners(pts: {x:number;y:number}[]) {
     const sum = pts.map(p => p.x + p.y);
     const diff = pts.map(p => p.x - p.y);
 
     const tl = pts[sum.indexOf(Math.min(...sum))];
     const br = pts[sum.indexOf(Math.max(...sum))];
-    const tr = pts[diff.indexOf(Math.min(...diff))];
-    const bl = pts[diff.indexOf(Math.max(...diff))];
+
+    const tr = pts[diff.indexOf(Math.max(...diff))];
+    const bl = pts[diff.indexOf(Math.min(...diff))];
 
     return [tl, tr, br, bl];
   }
