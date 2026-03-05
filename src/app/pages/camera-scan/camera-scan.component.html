@@ -1,4 +1,4 @@
-<!-- camera-scan.component.html (FULL UPDATED: OpenCV + multi receipts (max 10) + Save Debug + Upload) -->
+<!-- camera-scan.component.html (UPDATED: show part info for long receipts) -->
 <div class="rounded-2xl border bg-white p-6 shadow-sm">
   <!-- Header -->
   <div class="mb-4 flex items-center justify-between">
@@ -26,7 +26,8 @@
       <div class="mt-4 flex flex-wrap gap-3">
         <button
           class="rounded-lg bg-blue-600 px-4 py-2 text-white disabled:opacity-50"
-          (click)="captureWarped()"
+          (click)="captureWarped()
+"
           [disabled]="!canCapture || receipts.length >= MAX_RECEIPTS"
         >
           Capture
@@ -164,6 +165,9 @@
           <div class="flex-1">
             <div class="text-xs font-semibold text-gray-800">
               {{ r.source === 'camera' ? 'Camera' : 'Upload' }}
+              <span *ngIf="r.partCount && r.partIndex" class="ml-1 text-[11px] text-gray-500">
+                (Part {{ r.partIndex }}/{{ r.partCount }})
+              </span>
             </div>
             <div class="text-[11px] text-gray-500">
               {{ r.createdAt | date:'short' }} • {{ (r.blob.size / 1024 / 1024) | number:'1.2-2' }} MB
