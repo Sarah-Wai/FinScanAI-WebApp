@@ -119,7 +119,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   private readonly LONG_MIN_MATCH_SCORE = 0.55;     // TM_CCOEFF_NORMED threshold
   private readonly LONG_SEAM_PAD = 8;               // overlap padding to reduce seam
 
-  constructor(private router: Router) {}
+  constructor(private router: Router) { }
 
   // ============================
   // UI actions
@@ -197,7 +197,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
         advanced: [{ focusMode: 'continuous', exposureMode: 'continuous', whiteBalanceMode: 'continuous' }]
       } as any);
       console.log('camera settings:', track?.getSettings?.());
-    } catch {}
+    } catch { }
 
     const video = this.videoRef.nativeElement;
     video.srcObject = this.stream;
@@ -206,7 +206,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       video.onloadedmetadata = () => resolve();
     });
 
-    try { await video.play(); } catch {}
+    try { await video.play(); } catch { }
     await new Promise(r => setTimeout(r, 450)); // let focus settle
 
     this.resizeOverlayToVideoBox();
@@ -344,13 +344,13 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     return this.stableCount >= NEED_STABLE;
   }
 
-  private avgCornerMove(a: {x:number;y:number}[], b: {x:number;y:number}[]) {
+  private avgCornerMove(a: { x: number; y: number }[], b: { x: number; y: number }[]) {
     let sum = 0;
     for (let i = 0; i < 4; i++) sum += Math.hypot(a[i].x - b[i].x, a[i].y - b[i].y);
     return sum / 4;
   }
 
-  private polyAreaFrac(pts: {x:number;y:number}[]) {
+  private polyAreaFrac(pts: { x: number; y: number }[]) {
     let a = 0;
     for (let i = 0; i < 4; i++) {
       const j = (i + 1) % 4;
@@ -364,8 +364,8 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   }
 
   private smoothCorners(
-    prev: {x:number;y:number}[] | null,
-    next: {x:number;y:number}[],
+    prev: { x: number; y: number }[] | null,
+    next: { x: number; y: number }[],
     alpha = 0.7
   ) {
     if (!prev) return next;
@@ -471,7 +471,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       hierarchy = new cvAny.Mat();
       cvAny.findContours(edges, contours, hierarchy, cvAny.RETR_EXTERNAL, cvAny.CHAIN_APPROX_SIMPLE);
 
-      let bestPts: {x:number;y:number}[] | null = null;
+      let bestPts: { x: number; y: number }[] | null = null;
       let bestArea = 0;
 
       for (let i = 0; i < contours.size(); i++) {
@@ -485,7 +485,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
         if (approx.rows === 4 && cvAny.isContourConvex(approx)) {
           bestArea = area;
-          const pts: {x:number;y:number}[] = [];
+          const pts: { x: number; y: number }[] = [];
           for (let r = 0; r < 4; r++) {
             const x = approx.intPtr(r, 0)[0];
             const y = approx.intPtr(r, 0)[1];
@@ -511,7 +511,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     }
   }
 
-  private orderCorners(pts: {x:number;y:number}[]) {
+  private orderCorners(pts: { x: number; y: number }[]) {
     const sum = pts.map(p => p.x + p.y);
     const diff = pts.map(p => p.x - p.y);
 
@@ -573,7 +573,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     this.postProcessAndAddSingle(warpedCanvas, 'camera');
   }
 
-  private warpCanvasByCorners(canvasEl: HTMLCanvasElement, corners: {x:number;y:number}[]) {
+  private warpCanvasByCorners(canvasEl: HTMLCanvasElement, corners: { x: number; y: number }[]) {
     const cvAny: any = (window as any).cv;
     if (!cvAny?.imread) return null;
 
@@ -911,7 +911,10 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       this.enhanceReceiptCanvasMild(baseCanvas);
     }
 
-    if (this.sharpenAfterWarp) this.sharpenCanvas(baseCanvas, this.sharpenAmount);
+    // Only sharpen if NOT black/white
+    if (this.sharpenAfterWarp && !(this.adobeLikeEnhance && this.adobeBW)) {
+      this.sharpenCanvas(baseCanvas, this.sharpenAmount);
+    }
 
     baseCanvas.toBlob((blob: Blob | null) => {
       if (!blob) return;
@@ -930,14 +933,10 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     const cvAny: any = (window as any).cv;
     if (!cvAny?.imread) return;
 
-    let src: any;
-    let rgba: any;
-    let gray: any;
-    let bg: any;
-    let norm: any;
-    let claheOut: any;
-    let bw: any;
-    let out: any;
+    let src: any, rgba: any, gray: any;
+    let bg: any, norm: any, claheOut: any;
+    let blur: any, bw: any, out: any;
+    let kernel: any, tmp: any;
 
     try {
       src = cvAny.imread(c);
@@ -947,30 +946,32 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       if (src.channels() === 4) src.copyTo(rgba);
       else cvAny.cvtColor(src, rgba, cvAny.COLOR_BGR2RGBA);
 
-      // grayscale
+      // gray
       gray = new cvAny.Mat();
       cvAny.cvtColor(rgba, gray, cvAny.COLOR_RGBA2GRAY);
 
-      // illumination normalization: gray / blurred(gray) * 255
+      // --- 1) Better background estimation (reduces “paper texture” noise) ---
+      // Use morphological OPEN with a big kernel to estimate background illumination.
+      // (This is often more stable than medianBlur+divide for receipts.)
       bg = new cvAny.Mat();
-      cvAny.medianBlur(gray, bg, this.ADOBE_BG_BLUR);
+      kernel = cvAny.getStructuringElement(cvAny.MORPH_ELLIPSE, new cvAny.Size(31, 31));
+      cvAny.morphologyEx(gray, bg, cvAny.MORPH_OPEN, kernel);
 
+      // Normalize: gray - bg  (then stretch)
       norm = new cvAny.Mat();
-      cvAny.divide(gray, bg, norm, 255);
+      cvAny.subtract(gray, bg, norm);
 
-      // CLAHE
+      // Optional: small blur to calm noise BEFORE contrast/threshold
+      blur = new cvAny.Mat();
+      cvAny.GaussianBlur(norm, blur, new cvAny.Size(3, 3), 0);
+
+      // --- 2) Contrast boost (CLAHE) ---
       claheOut = new cvAny.Mat();
-      if (cvAny.createCLAHE) {
-        const clahe = cvAny.createCLAHE(this.ADOBE_CLAHE_CLIP, new cvAny.Size(8, 8));
-        clahe.apply(norm, claheOut);
-        clahe.delete();
-      } else {
-        cvAny.equalizeHist(norm, claheOut);
-      }
+      const clahe = cvAny.createCLAHE(2.2, new cvAny.Size(8, 8)); // gentler than 3.0
+      clahe.apply(blur, claheOut);
+      clahe.delete();
 
       if (keepColor) {
-        // keep color look: replace luminance with enhanced gray
-        // (simple method: convert to RGBA using enhanced gray)
         out = new cvAny.Mat();
         cvAny.cvtColor(claheOut, out, cvAny.COLOR_GRAY2RGBA);
         cvAny.imshow(c, out);
@@ -978,24 +979,22 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       }
 
       if (bwOutput) {
-        // adaptive threshold -> “Adobe Scan” white paper look
+        // --- 3) Thresholding: prefer OTSU (cleaner for receipts) ---
         bw = new cvAny.Mat();
-        const blockSize = (this.ADOBE_BLOCK % 2 === 1) ? this.ADOBE_BLOCK : (this.ADOBE_BLOCK + 1);
-        cvAny.adaptiveThreshold(
-          claheOut,
-          bw,
-          255,
-          cvAny.ADAPTIVE_THRESH_GAUSSIAN_C,
-          cvAny.THRESH_BINARY,
-          blockSize,
-          this.ADOBE_C
-        );
+        cvAny.threshold(claheOut, bw, 0, 255, cvAny.THRESH_BINARY | cvAny.THRESH_OTSU);
+
+        // --- 4) Speckle cleanup ---
+        // Opening removes tiny dots; closing reconnects small character gaps.
+        tmp = new cvAny.Mat();
+        const kSmall = cvAny.getStructuringElement(cvAny.MORPH_RECT, new cvAny.Size(2, 2));
+        cvAny.morphologyEx(bw, tmp, cvAny.MORPH_OPEN, kSmall);
+        cvAny.morphologyEx(tmp, bw, cvAny.MORPH_CLOSE, kSmall);
+        kSmall.delete();
 
         out = new cvAny.Mat();
         cvAny.cvtColor(bw, out, cvAny.COLOR_GRAY2RGBA);
         cvAny.imshow(c, out);
       } else {
-        // grayscale enhanced
         out = new cvAny.Mat();
         cvAny.cvtColor(claheOut, out, cvAny.COLOR_GRAY2RGBA);
         cvAny.imshow(c, out);
@@ -1003,14 +1002,10 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     } catch (e) {
       console.warn('enhanceReceiptCanvasAdobeLike failed', e);
     } finally {
-      src?.delete?.();
-      rgba?.delete?.();
-      gray?.delete?.();
-      bg?.delete?.();
-      norm?.delete?.();
-      claheOut?.delete?.();
-      bw?.delete?.();
-      out?.delete?.();
+      src?.delete?.(); rgba?.delete?.(); gray?.delete?.();
+      bg?.delete?.(); norm?.delete?.(); claheOut?.delete?.();
+      blur?.delete?.(); bw?.delete?.(); out?.delete?.();
+      tmp?.delete?.(); kernel?.delete?.();
     }
   }
 
@@ -1058,7 +1053,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     const h = c.height;
 
     const copy = new Uint8ClampedArray(data);
-    const idx = (x:number,y:number)=> (y*w + x) * 4;
+    const idx = (x: number, y: number) => (y * w + x) * 4;
 
     for (let y = 1; y < h - 1; y++) {
       for (let x = 1; x < w - 1; x++) {
