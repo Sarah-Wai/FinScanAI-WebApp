@@ -107,7 +107,16 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   private readonly LONG_MIN_MATCH_SCORE = 0.55;
   private readonly LONG_SEAM_PAD = 8;
 
-  constructor(private router: Router) {}
+  private stableScore = 0;              // 0..100
+  private readonly STABLE_ON = 65;      // green turns on
+  private readonly STABLE_OFF = 45;     // hysteresis: stays green until drops below
+  private readonly STABLE_GAIN = 18;    // add when good
+  private readonly STABLE_DECAY = 10;   // subtract when shaky
+  private readonly STABLE_MAX = 100;
+  private readonly MIN_AREA_FRAC = 0.12;     // keep your current
+  private readonly MIN_QUAD_QUALITY = 0.35;  // new (0..1)
+
+  constructor(private router: Router) { }
 
   // ============================
   // UI actions
@@ -185,7 +194,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
         advanced: [{ focusMode: 'continuous', exposureMode: 'continuous', whiteBalanceMode: 'continuous' }]
       } as any);
       console.log('camera settings:', track?.getSettings?.());
-    } catch {}
+    } catch { }
 
     const video = this.videoRef.nativeElement;
     video.srcObject = this.stream;
@@ -194,7 +203,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       video.onloadedmetadata = () => resolve();
     });
 
-    try { await video.play(); } catch {}
+    try { await video.play(); } catch { }
     await new Promise(r => setTimeout(r, 450)); // let focus settle
 
     this.resizeOverlayToVideoBox();
@@ -243,7 +252,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   private startDetectLoop() {
     if (!this.cvReady) return;
     this.stopDetectLoop();
-    this.detectTimer = window.setInterval(() => this.detectOnce(), 220);
+    this.detectTimer = window.setInterval(() => this.detectOnce(), 280);
   }
 
   private stopDetectLoop() {
@@ -284,6 +293,8 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     }
 
     const ok = this.updateStability(corners, areaFrac);
+    const progress = Math.round(this.stableScore);
+
     this.canCapture = ok;
 
     const MIN_AREA_FRAC_HINT = 0.12;
@@ -293,52 +304,102 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     } else if (areaFrac < MIN_AREA_FRAC_HINT) {
       this.cameraHint = 'Move closer — receipt too small';
     } else if (!ok) {
-      this.cameraHint = 'Hold steady…';
+      this.cameraHint = `Hold steady… (${progress}%)`;
     } else if (this.receipts.length >= this.MAX_RECEIPTS) {
       this.cameraHint = `Limit reached (${this.MAX_RECEIPTS}). Process or clear.`;
-    } else {
+    }
+    else {
       this.cameraHint = 'Looks good — you can Capture.';
     }
 
+
     this.drawOverlayCorners(corners, W, H);
+  }
+
+  private quadQuality(pts: { x: number; y: number }[]): number {
+    // pts are [tl,tr,br,bl]
+    const d = (a: any, b: any) => Math.hypot(a.x - b.x, a.y - b.y);
+
+    const wTop = d(pts[0], pts[1]);
+    const wBot = d(pts[3], pts[2]);
+    const hL = d(pts[0], pts[3]);
+    const hR = d(pts[1], pts[2]);
+
+    const w = (wTop + wBot) / 2;
+    const h = (hL + hR) / 2;
+    if (w < 40 || h < 60) return 0; // too small quad
+
+    // rectangle-ness: opposite sides similar
+    const wSim = 1 - Math.min(1, Math.abs(wTop - wBot) / Math.max(1, w));
+    const hSim = 1 - Math.min(1, Math.abs(hL - hR) / Math.max(1, h));
+
+    // area sanity
+    const areaFrac = this.polyAreaFrac(pts);
+    const areaOk = Math.min(1, areaFrac / 0.20); // 0.20+ gets full score
+
+    // combine (0..1)
+    return 0.45 * wSim + 0.45 * hSim + 0.10 * areaOk;
   }
 
   private updateStability(
     corners: { x: number; y: number }[] | null,
     areaFrac: number
   ): boolean {
-    const MIN_AREA_FRAC = 0.12;
-    const NEED_STABLE = 2;
-
-    if (!corners || corners.length !== 4 || areaFrac < MIN_AREA_FRAC) {
-      this.lastCorners = null;
-      this.stableCount = 0;
-      return false;
+    // If no corners or too small -> decay score (don’t hard reset)
+    if (!corners || corners.length !== 4 || areaFrac < this.MIN_AREA_FRAC) {
+      this.stableScore = Math.max(0, this.stableScore - this.STABLE_DECAY * 2);
+      this.lastCorners = corners;
+      return this.canCapture ? (this.stableScore >= this.STABLE_OFF) : false;
     }
 
+    // Shape quality check (reduces random flicker)
+    const q = this.quadQuality(corners);
+    if (q < this.MIN_QUAD_QUALITY) {
+      this.stableScore = Math.max(0, this.stableScore - this.STABLE_DECAY * 2);
+      this.lastCorners = corners;
+      return this.canCapture ? (this.stableScore >= this.STABLE_OFF) : false;
+    }
+
+    // First frame
     if (!this.lastCorners) {
       this.lastCorners = corners;
-      this.stableCount = 0;
+      this.stableScore = Math.max(0, this.stableScore - this.STABLE_DECAY);
       return false;
     }
 
+    // Movement
     const avgMove = this.avgCornerMove(this.lastCorners, corners);
     this.lastCorners = corners;
 
-    const moveThresh = Math.max(3, Math.min(9, this.lastWorkW * 0.012));
-    if (avgMove < moveThresh) this.stableCount++;
-    else this.stableCount = 0;
+    // Dynamic threshold based on work width
+    const moveOk = this.isMoveStable(avgMove);
 
-    return this.stableCount >= NEED_STABLE;
+    if (moveOk) {
+      this.stableScore = Math.min(this.STABLE_MAX, this.stableScore + this.STABLE_GAIN);
+    } else {
+      this.stableScore = Math.max(0, this.stableScore - this.STABLE_DECAY);
+    }
+
+    // Hysteresis so green doesn’t flicker off instantly
+    if (this.canCapture) return this.stableScore >= this.STABLE_OFF;
+    return this.stableScore >= this.STABLE_ON;
   }
 
-  private avgCornerMove(a: {x:number;y:number}[], b: {x:number;y:number}[]) {
+  private isMoveStable(avgMove: number): boolean {
+    // More forgiving than your old moveThresh
+    // (Work width ~420 => thresh ~7-10 px)
+    const base = this.lastWorkW > 0 ? this.lastWorkW : 420;
+    const thresh = Math.max(6, Math.min(14, base * 0.022));
+    return avgMove < thresh;
+  }
+
+  private avgCornerMove(a: { x: number; y: number }[], b: { x: number; y: number }[]) {
     let sum = 0;
     for (let i = 0; i < 4; i++) sum += Math.hypot(a[i].x - b[i].x, a[i].y - b[i].y);
     return sum / 4;
   }
 
-  private polyAreaFrac(pts: {x:number;y:number}[]) {
+  private polyAreaFrac(pts: { x: number; y: number }[]) {
     let a = 0;
     for (let i = 0; i < 4; i++) {
       const j = (i + 1) % 4;
@@ -352,8 +413,8 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   }
 
   private smoothCorners(
-    prev: {x:number;y:number}[] | null,
-    next: {x:number;y:number}[],
+    prev: { x: number; y: number }[] | null,
+    next: { x: number; y: number }[],
     alpha = 0.7
   ) {
     if (!prev) return next;
@@ -459,7 +520,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       hierarchy = new cvAny.Mat();
       cvAny.findContours(edges, contours, hierarchy, cvAny.RETR_EXTERNAL, cvAny.CHAIN_APPROX_SIMPLE);
 
-      let bestPts: {x:number;y:number}[] | null = null;
+      let bestPts: { x: number; y: number }[] | null = null;
       let bestArea = 0;
 
       for (let i = 0; i < contours.size(); i++) {
@@ -473,7 +534,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
         if (approx.rows === 4 && cvAny.isContourConvex(approx)) {
           bestArea = area;
-          const pts: {x:number;y:number}[] = [];
+          const pts: { x: number; y: number }[] = [];
           for (let r = 0; r < 4; r++) {
             const x = approx.intPtr(r, 0)[0];
             const y = approx.intPtr(r, 0)[1];
@@ -499,7 +560,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     }
   }
 
-  private orderCorners(pts: {x:number;y:number}[]) {
+  private orderCorners(pts: { x: number; y: number }[]) {
     const sum = pts.map(p => p.x + p.y);
     const diff = pts.map(p => p.x - p.y);
 
@@ -561,7 +622,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     this.postProcessAndAddSingle(warpedCanvas, 'camera');
   }
 
-  private warpCanvasByCorners(canvasEl: HTMLCanvasElement, corners: {x:number;y:number}[]) {
+  private warpCanvasByCorners(canvasEl: HTMLCanvasElement, corners: { x: number; y: number }[]) {
     const cvAny: any = (window as any).cv;
     if (!cvAny?.imread) return null;
 
@@ -1053,7 +1114,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     const h = c.height;
 
     const copy = new Uint8ClampedArray(data);
-    const idx = (x:number,y:number)=> (y*w + x) * 4;
+    const idx = (x: number, y: number) => (y * w + x) * 4;
 
     for (let y = 1; y < h - 1; y++) {
       for (let x = 1; x < w - 1; x++) {
