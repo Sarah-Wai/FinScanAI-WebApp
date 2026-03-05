@@ -1,4 +1,4 @@
-// camera-scan.component.ts (FULL UPDATED: stable green + Long Receipt Mode (guided vertical stitch))
+// camera-scan.component.ts (FULL UPDATED: stable green + Smooth Long Receipt Mode (guided stitch, no segments))
 import { Component, ElementRef, ViewChild, AfterViewInit, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { Router } from '@angular/router';
@@ -23,9 +23,9 @@ type ReceiptShot = {
 })
 export class CameraScanComponent implements AfterViewInit, OnDestroy {
   @ViewChild('video') videoRef!: ElementRef<HTMLVideoElement>;
-  @ViewChild('canvas') canvasRef!: ElementRef<HTMLCanvasElement>;
-  @ViewChild('work') workRef!: ElementRef<HTMLCanvasElement>;
-  @ViewChild('overlay') overlayRef!: ElementRef<HTMLCanvasElement>;
+  @ViewChild('canvas') canvasRef!: ElementRef<HTMLCanvasElement>;   // full-res capture
+  @ViewChild('work') workRef!: ElementRef<HTMLCanvasElement>;       // low-res detection
+  @ViewChild('overlay') overlayRef!: ElementRef<HTMLCanvasElement>; // overlay polygon
 
   // ============================
   // Batch / multi receipts
@@ -49,7 +49,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
   showGrid = true;
 
-  canCapture = false;
+  canCapture = false; // used for UI hint (polygon color)
   cameraHint = 'Loading OpenCV...';
   private cvReady = false;
   private detectTimer?: number;
@@ -67,7 +67,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   sharpenAfterWarp = true;
 
   // ============================
-  // Long Receipt Mode (guided stitch)
+  // Long Receipt Mode (SMOOTH guided stitch)
   // ============================
   isLongMode = false;
   private longTimer?: number;
@@ -75,15 +75,27 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   private stitchCanvas?: HTMLCanvasElement;
   private stitchCtx?: CanvasRenderingContext2D | null;
 
-  private lastAcceptedFrame?: HTMLCanvasElement;
+  // Reused canvases (avoid allocating each frame)
+  private longFrameCanvas?: HTMLCanvasElement;
+  private longFrameCtx?: CanvasRenderingContext2D | null;
+
+  private prevFrameCanvas?: HTMLCanvasElement;
+  private prevFrameCtx?: CanvasRenderingContext2D | null;
+
   private noNewCount = 0;
 
-  private readonly LONG_CAPTURE_MS = 280;
-  private readonly LONG_FRAME_W = 900;        // 720~1080 recommended
-  private readonly LONG_MAX_STITCH_H = 14000; // prevent memory crash
-  private readonly LONG_BLUR_MIN = 70;        // tune per device
-  private readonly LONG_MIN_DY = 70;          // minimal movement to accept new content
-  private readonly LONG_STOP_NO_NEW = 10;     // stop after N duplicate frames
+  // Perf / quality tuning (safe defaults)
+  private readonly LONG_CAPTURE_MS = 320;       // 280~400
+  private readonly LONG_FRAME_W = 720;          // 720~1080 (lower = faster)
+  private readonly LONG_MAX_STITCH_H = 14000;   // avoid memory crash
+  private readonly LONG_BLUR_MIN = 70;          // tune per device (variance Laplacian)
+  private readonly LONG_MIN_DY = 70;            // minimal movement to accept new content
+  private readonly LONG_STOP_NO_NEW = 10;       // auto stop if duplicates
+
+  // Fast matching settings
+  private readonly LONG_MATCH_SCALE = 0.40;        // 0.35~0.55 (lower=faster)
+  private readonly LONG_CENTER_STRIP_W_FRAC = 0.55; // match only center width
+  private readonly LONG_STRIP_H_FRAC = 0.22;        // template height fraction
 
   constructor(private router: Router) {}
 
@@ -233,7 +245,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
   private detectOnce() {
     if (!this.cvReady) return;
-    if (this.isLongMode) return;
+    if (this.isLongMode) return; // don't fight overlay while long mode runs
 
     const video = this.videoRef.nativeElement;
     if (!video.videoWidth || !video.videoHeight) return;
@@ -494,6 +506,8 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   // Capture + warp (single shot)
   // ============================
   captureWarped() {
+    if (this.isLongMode) return;
+
     if (this.receipts.length >= this.MAX_RECEIPTS) {
       this.limitMsg = `Max ${this.MAX_RECEIPTS} receipts per batch. Process or clear first.`;
       return;
@@ -584,7 +598,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   }
 
   // ============================
-  // Long Receipt Mode
+  // Long Receipt Mode (SMOOTH)
   // ============================
   startLongReceipt() {
     if (!this.cvReady) return;
@@ -599,16 +613,24 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     this.limitMsg = '';
     this.uploadMsg = '';
     this.noNewCount = 0;
-    this.lastAcceptedFrame = undefined;
 
+    // Stitch canvas
     this.stitchCanvas = document.createElement('canvas');
     this.stitchCanvas.width = 0;
     this.stitchCanvas.height = 0;
     this.stitchCtx = this.stitchCanvas.getContext('2d');
 
+    // Reused capture canvas
+    this.longFrameCanvas = document.createElement('canvas');
+    this.longFrameCtx = this.longFrameCanvas.getContext('2d', { willReadFrequently: true });
+
+    // Reused prev canvas
+    this.prevFrameCanvas = document.createElement('canvas');
+    this.prevFrameCtx = this.prevFrameCanvas.getContext('2d', { willReadFrequently: true });
+
     this.cameraHint = 'Long mode: start at TOP, move DOWN slowly…';
 
-    this.longTimer = window.setInterval(() => this.captureLongFrame(), this.LONG_CAPTURE_MS);
+    this.longTimer = window.setInterval(() => this.captureLongFrameFast(), this.LONG_CAPTURE_MS);
   }
 
   stopLongReceipt(save: boolean) {
@@ -621,6 +643,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     this.isLongMode = false;
 
     if (!save || !wasLong) {
+      this.cameraHint = 'Long mode canceled.';
       return;
     }
 
@@ -633,36 +656,45 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     this.cameraHint = 'Saved long receipt as one image.';
   }
 
-  private captureLongFrame() {
+  private captureLongFrameFast() {
     const video = this.videoRef.nativeElement;
     if (!video.videoWidth || !video.videoHeight) return;
 
-    const frame = document.createElement('canvas');
+    if (!this.longFrameCanvas || !this.longFrameCtx || !this.prevFrameCanvas || !this.prevFrameCtx || !this.stitchCanvas || !this.stitchCtx) {
+      return;
+    }
+
     const W = this.LONG_FRAME_W;
     const H = Math.round((video.videoHeight / video.videoWidth) * W);
-    frame.width = W;
-    frame.height = H;
 
-    const fctx = frame.getContext('2d', { willReadFrequently: true });
-    if (!fctx) return;
+    this.longFrameCanvas.width = W;
+    this.longFrameCanvas.height = H;
 
-    fctx.drawImage(video, 0, 0, W, H);
+    // draw current frame
+    this.longFrameCtx.drawImage(video, 0, 0, W, H);
 
-    const blur = this.blurScore(frame);
+    // reject blurry frames
+    const blur = this.blurScore(this.longFrameCanvas);
     if (blur < this.LONG_BLUR_MIN) {
       this.cameraHint = 'Too blurry—hold steadier / more light…';
       return;
     }
 
-    if (!this.lastAcceptedFrame) {
+    // first accepted frame -> initialize stitch
+    if (this.prevFrameCanvas.width === 0 || this.prevFrameCanvas.height === 0) {
+      this.prevFrameCanvas.width = W;
+      this.prevFrameCanvas.height = H;
+      this.prevFrameCtx.drawImage(this.longFrameCanvas, 0, 0);
+
       this.ensureStitchCanvas(W, Math.min(H, this.LONG_MAX_STITCH_H));
-      this.stitchCtx!.drawImage(frame, 0, 0);
-      this.lastAcceptedFrame = frame;
+      this.stitchCtx.drawImage(this.longFrameCanvas, 0, 0);
+
       this.cameraHint = 'Good. Now move DOWN slowly…';
       return;
     }
 
-    const dy = this.estimateVerticalShift(this.lastAcceptedFrame, frame);
+    // estimate vertical shift (FAST)
+    const dy = this.estimateVerticalShiftFast(this.prevFrameCanvas, this.longFrameCanvas);
 
     if (dy < this.LONG_MIN_DY) {
       this.noNewCount++;
@@ -676,11 +708,12 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
     this.noNewCount = 0;
 
+    // append only new region
     const newY = dy;
-    const newH = frame.height - newY;
+    const newH = H - newY;
     if (newH <= 50) return;
 
-    const nextH = (this.stitchCanvas!.height + newH);
+    const nextH = this.stitchCanvas.height + newH;
     if (nextH > this.LONG_MAX_STITCH_H) {
       this.cameraHint = 'Reached max length—saving.';
       this.stopLongReceipt(true);
@@ -689,13 +722,16 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
     this.growStitchCanvas(nextH);
 
-    this.stitchCtx!.drawImage(
-      frame,
-      0, newY, frame.width, newH,
-      0, this.stitchCanvas!.height - newH, frame.width, newH
+    this.stitchCtx.drawImage(
+      this.longFrameCanvas,
+      0, newY, W, newH,
+      0, this.stitchCanvas.height - newH, W, newH
     );
 
-    this.lastAcceptedFrame = frame;
+    // update prev frame (copy current into prev)
+    this.prevFrameCtx.clearRect(0, 0, W, H);
+    this.prevFrameCtx.drawImage(this.longFrameCanvas, 0, 0);
+
     this.cameraHint = `Capturing… (+${newH}px)`;
   }
 
@@ -717,7 +753,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       cvAny.meanStdDev(lap, mean, std);
 
       const s = std.data64F[0];
-      return s * s;
+      return s * s; // variance
     } catch {
       return 0;
     } finally {
@@ -725,41 +761,62 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     }
   }
 
-  private estimateVerticalShift(prevCanvas: HTMLCanvasElement, currCanvas: HTMLCanvasElement): number {
+  private estimateVerticalShiftFast(prevCanvas: HTMLCanvasElement, currCanvas: HTMLCanvasElement): number {
     const cvAny: any = (window as any).cv;
     if (!cvAny?.imread) return 0;
 
-    let prev: any, curr: any, pg: any, cg: any, templ: any, res: any;
+    let prev: any, curr: any, pg: any, cg: any, res: any;
     try {
+      const scale = this.LONG_MATCH_SCALE;
+
       prev = cvAny.imread(prevCanvas);
       curr = cvAny.imread(currCanvas);
 
-      pg = new cvAny.Mat(); cg = new cvAny.Mat();
+      pg = new cvAny.Mat();
+      cg = new cvAny.Mat();
       cvAny.cvtColor(prev, pg, cvAny.COLOR_RGBA2GRAY);
       cvAny.cvtColor(curr, cg, cvAny.COLOR_RGBA2GRAY);
 
-      const stripH = Math.max(80, Math.floor(prevCanvas.height * 0.22));
-      const y0 = prevCanvas.height - stripH;
+      const pSmall = new cvAny.Mat();
+      const cSmall = new cvAny.Mat();
+      cvAny.resize(pg, pSmall, new cvAny.Size(0, 0), scale, scale, cvAny.INTER_AREA);
+      cvAny.resize(cg, cSmall, new cvAny.Size(0, 0), scale, scale, cvAny.INTER_AREA);
 
-      templ = pg.roi(new cvAny.Rect(0, y0, prevCanvas.width, stripH));
+      const W = pSmall.cols;
+      const H = pSmall.rows;
 
-      const resultCols = cg.cols - templ.cols + 1;
-      const resultRows = cg.rows - templ.rows + 1;
-      if (resultCols <= 0 || resultRows <= 0) return 0;
+      const stripW = Math.max(50, Math.floor(W * this.LONG_CENTER_STRIP_W_FRAC));
+      const stripX = Math.max(0, Math.floor((W - stripW) / 2));
+
+      const stripH = Math.max(60, Math.floor(H * this.LONG_STRIP_H_FRAC));
+      const y0 = Math.max(0, H - stripH);
+
+      const pRoi = pSmall.roi(new cvAny.Rect(stripX, y0, stripW, stripH));
+      const cRoi = cSmall.roi(new cvAny.Rect(stripX, 0, stripW, H));
+
+      const resultCols = cRoi.cols - pRoi.cols + 1; // should be 1
+      const resultRows = cRoi.rows - pRoi.rows + 1;
+      if (resultCols <= 0 || resultRows <= 0) {
+        pRoi.delete(); cRoi.delete(); pSmall.delete(); cSmall.delete();
+        return 0;
+      }
 
       res = new cvAny.Mat(resultRows, resultCols, cvAny.CV_32FC1);
-      cvAny.matchTemplate(cg, templ, res, cvAny.TM_CCOEFF_NORMED);
+      cvAny.matchTemplate(cRoi, pRoi, res, cvAny.TM_CCOEFF_NORMED);
 
       const mm = cvAny.minMaxLoc(res);
       const bestY = mm.maxLoc.y;
 
-      const dy = y0 - bestY;
+      const dySmall = y0 - bestY;
+      const dy = dySmall / scale;
+
+      pRoi.delete(); cRoi.delete(); pSmall.delete(); cSmall.delete();
       return Math.max(0, Math.round(dy));
     } catch {
       return 0;
     } finally {
       prev?.delete?.(); curr?.delete?.(); pg?.delete?.(); cg?.delete?.();
-      templ?.delete?.(); res?.delete?.();
+      res?.delete?.();
     }
   }
 
@@ -787,7 +844,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   }
 
   // ============================
-  // Post-process + add (SINGLE image only)
+  // Post-process + add (SINGLE image)
   // ============================
   private postProcessAndAddSingle(
     baseCanvas: HTMLCanvasElement,
@@ -904,10 +961,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     return (crypto as any)?.randomUUID?.() ?? `${Date.now()}_${Math.random().toString(16).slice(2)}`;
   }
 
-  private addReceipt(
-    blob: Blob,
-    source: 'camera' | 'upload'
-  ) {
+  private addReceipt(blob: Blob, source: 'camera' | 'upload') {
     if (this.receipts.length >= this.MAX_RECEIPTS) {
       this.limitMsg = `Max ${this.MAX_RECEIPTS} receipts per batch. Process or clear first.`;
       return false;
