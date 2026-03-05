@@ -1,4 +1,4 @@
-// camera-scan.component.ts (FULL UPDATED: stable green + Smooth Long Receipt Mode (guided stitch, no segments))
+// camera-scan.component.ts (FULL UPDATED: stable green + Smooth Long Receipt Mode + Adobe-like enhancement)
 import { Component, ElementRef, ViewChild, AfterViewInit, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { Router } from '@angular/router';
@@ -62,9 +62,25 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   private lastWorkW = 0;
   private lastWorkH = 0;
 
-  // Quality toggles (used by HTML ngModel)
+  // ============================
+  // Output / Quality toggles (bind via ngModel in HTML if you want)
+  // ============================
   saveAsPng = false;
+
+  // Adobe-like enhancement toggles
+  adobeLikeEnhance = true;     // ON: white background + strong contrast (Adobe-like)
+  adobeBW = true;              // ON: black/white output (best for OCR)
+  keepColorPreview = false;    // If true, keeps color but improves lighting (less “scan” look)
+
+  // Optional sharpening after enhancement
   sharpenAfterWarp = true;
+  sharpenAmount = 0.12;        // 0.08 ~ 0.20 (too high => noisy)
+
+  // Adobe-like parameters (safe defaults)
+  private readonly ADOBE_BG_BLUR = 51;     // 31~71 (bigger removes more shadows)
+  private readonly ADOBE_CLAHE_CLIP = 3.0; // 2.0~4.0
+  private readonly ADOBE_BLOCK = 25;       // adaptive threshold blockSize (odd)
+  private readonly ADOBE_C = 10;           // adaptive threshold C (6~12)
 
   // ============================
   // Long Receipt Mode (SMOOTH guided stitch)
@@ -632,10 +648,11 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
     // Reused prev canvas
     this.prevFrameCanvas = document.createElement('canvas');
+    this.prevFrameCanvas.width = 0;
+    this.prevFrameCanvas.height = 0;
     this.prevFrameCtx = this.prevFrameCanvas.getContext('2d', { willReadFrequently: true });
 
     this.cameraHint = 'Long mode: start at TOP, move DOWN slowly…';
-
     this.longTimer = window.setInterval(() => this.captureLongFrameFast(), this.LONG_CAPTURE_MS);
   }
 
@@ -648,7 +665,6 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     const wasLong = this.isLongMode;
     this.isLongMode = false;
 
-    // cleanup references (avoid weird stale state)
     const stitch = this.stitchCanvas;
     this.stitchCanvas = undefined;
     this.stitchCtx = null;
@@ -708,7 +724,6 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       return;
     }
 
-    // FIXED LONG MODE: estimate overlap cut line (not dy)
     const match = this.estimateOverlapCutYFast(this.prevFrameCanvas, this.longFrameCanvas);
     if (!match.ok) {
       this.noNewCount++;
@@ -720,15 +735,11 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       return;
     }
 
-    // cutFromTop = where overlap ends in current frame
     let cutFromTop = match.cutY;
-
-    // seam padding (keep a little overlap so text lines don’t break)
     cutFromTop = Math.max(0, Math.min(H - 1, cutFromTop - this.LONG_SEAM_PAD));
 
     const newH = H - cutFromTop;
 
-    // require enough new content
     if (newH < this.LONG_MIN_APPEND_H) {
       this.noNewCount++;
       this.cameraHint = 'Move down a bit more…';
@@ -750,14 +761,12 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
 
     this.growStitchCanvas(nextH);
 
-    // append only new region
     this.stitchCtx.drawImage(
       this.longFrameCanvas,
       0, cutFromTop, W, newH,
       0, this.stitchCanvas.height - newH, W, newH
     );
 
-    // update prev frame (copy current into prev)
     this.prevFrameCtx.clearRect(0, 0, W, H);
     this.prevFrameCtx.drawImage(this.longFrameCanvas, 0, 0);
 
@@ -782,7 +791,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       cvAny.meanStdDev(lap, mean, std);
 
       const s = std.data64F[0];
-      return s * s; // variance
+      return s * s;
     } catch {
       return 0;
     } finally {
@@ -790,7 +799,6 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     }
   }
 
-  // FIXED LONG MODE: return overlap cut line from TOP of curr
   private estimateOverlapCutYFast(
     prevCanvas: HTMLCanvasElement,
     currCanvas: HTMLCanvasElement
@@ -822,15 +830,12 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       const stripX = Math.max(0, Math.floor((W - stripW) / 2));
 
       const stripH = Math.max(70, Math.floor(H * this.LONG_STRIP_H_FRAC));
-      const y0Prev = Math.max(0, H - stripH); // bottom strip of prev
+      const y0Prev = Math.max(0, H - stripH);
 
-      // template = bottom strip of prev
       const pRoi = pSmall.roi(new cvAny.Rect(stripX, y0Prev, stripW, stripH));
-
-      // search area = full height of curr (same width center)
       const cRoi = cSmall.roi(new cvAny.Rect(stripX, 0, stripW, H));
 
-      const resultCols = cRoi.cols - pRoi.cols + 1; // should be 1
+      const resultCols = cRoi.cols - pRoi.cols + 1;
       const resultRows = cRoi.rows - pRoi.rows + 1;
       if (resultCols <= 0 || resultRows <= 0) {
         pRoi.delete(); cRoi.delete(); pSmall.delete(); cSmall.delete();
@@ -844,31 +849,20 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       const bestY = mm.maxLoc.y;
       const score = mm.maxVal;
 
-      // IMPORTANT: overlap ends at bestY + stripH in curr (small)
       const cutSmall = bestY + stripH;
       const cutY = Math.round(cutSmall / scale);
 
       pRoi.delete(); cRoi.delete(); pSmall.delete(); cSmall.delete();
 
       if (score < this.LONG_MIN_MATCH_SCORE) {
-        return {
-          ok: false,
-          cutY,
-          score,
-          hint: 'Can’t align—keep receipt centered & move DOWN slower…'
-        };
+        return { ok: false, cutY, score, hint: 'Can’t align—keep centered & move DOWN slower…' };
       }
 
-      return {
-        ok: true,
-        cutY: Math.max(0, cutY),
-        score
-      };
+      return { ok: true, cutY: Math.max(0, cutY), score };
     } catch {
       return { ok: false, cutY: 0, score: 0, hint: 'Matching failed—try again' };
     } finally {
-      prev?.delete?.(); curr?.delete?.(); pg?.delete?.(); cg?.delete?.();
-      res?.delete?.();
+      prev?.delete?.(); curr?.delete?.(); pg?.delete?.(); cg?.delete?.(); res?.delete?.();
     }
   }
 
@@ -905,8 +899,19 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     const mime = this.saveAsPng ? 'image/png' : 'image/jpeg';
     const quality = this.saveAsPng ? undefined : 0.95;
 
-    this.enhanceReceiptCanvas(baseCanvas);
-    if (this.sharpenAfterWarp) this.sharpenCanvas(baseCanvas, 0.15);
+    // ✅ Adobe-like pipeline here
+    if (this.adobeLikeEnhance) {
+      this.enhanceReceiptCanvasAdobeLike(
+        baseCanvas,
+        this.adobeBW,
+        this.keepColorPreview
+      );
+    } else {
+      // fallback to your older “mild” enhancement if you ever want it
+      this.enhanceReceiptCanvasMild(baseCanvas);
+    }
+
+    if (this.sharpenAfterWarp) this.sharpenCanvas(baseCanvas, this.sharpenAmount);
 
     baseCanvas.toBlob((blob: Blob | null) => {
       if (!blob) return;
@@ -915,9 +920,102 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
   }
 
   // ============================
-  // Enhance + sharpen (OCR)
+  // Adobe-like enhancement (white bg, high contrast, OCR-friendly)
   // ============================
-  private enhanceReceiptCanvas(c: HTMLCanvasElement) {
+  private enhanceReceiptCanvasAdobeLike(
+    c: HTMLCanvasElement,
+    bwOutput: boolean,
+    keepColor: boolean
+  ) {
+    const cvAny: any = (window as any).cv;
+    if (!cvAny?.imread) return;
+
+    let src: any;
+    let rgba: any;
+    let gray: any;
+    let bg: any;
+    let norm: any;
+    let claheOut: any;
+    let bw: any;
+    let out: any;
+
+    try {
+      src = cvAny.imread(c);
+
+      // ensure RGBA
+      rgba = new cvAny.Mat();
+      if (src.channels() === 4) src.copyTo(rgba);
+      else cvAny.cvtColor(src, rgba, cvAny.COLOR_BGR2RGBA);
+
+      // grayscale
+      gray = new cvAny.Mat();
+      cvAny.cvtColor(rgba, gray, cvAny.COLOR_RGBA2GRAY);
+
+      // illumination normalization: gray / blurred(gray) * 255
+      bg = new cvAny.Mat();
+      cvAny.medianBlur(gray, bg, this.ADOBE_BG_BLUR);
+
+      norm = new cvAny.Mat();
+      cvAny.divide(gray, bg, norm, 255);
+
+      // CLAHE
+      claheOut = new cvAny.Mat();
+      if (cvAny.createCLAHE) {
+        const clahe = cvAny.createCLAHE(this.ADOBE_CLAHE_CLIP, new cvAny.Size(8, 8));
+        clahe.apply(norm, claheOut);
+        clahe.delete();
+      } else {
+        cvAny.equalizeHist(norm, claheOut);
+      }
+
+      if (keepColor) {
+        // keep color look: replace luminance with enhanced gray
+        // (simple method: convert to RGBA using enhanced gray)
+        out = new cvAny.Mat();
+        cvAny.cvtColor(claheOut, out, cvAny.COLOR_GRAY2RGBA);
+        cvAny.imshow(c, out);
+        return;
+      }
+
+      if (bwOutput) {
+        // adaptive threshold -> “Adobe Scan” white paper look
+        bw = new cvAny.Mat();
+        const blockSize = (this.ADOBE_BLOCK % 2 === 1) ? this.ADOBE_BLOCK : (this.ADOBE_BLOCK + 1);
+        cvAny.adaptiveThreshold(
+          claheOut,
+          bw,
+          255,
+          cvAny.ADAPTIVE_THRESH_GAUSSIAN_C,
+          cvAny.THRESH_BINARY,
+          blockSize,
+          this.ADOBE_C
+        );
+
+        out = new cvAny.Mat();
+        cvAny.cvtColor(bw, out, cvAny.COLOR_GRAY2RGBA);
+        cvAny.imshow(c, out);
+      } else {
+        // grayscale enhanced
+        out = new cvAny.Mat();
+        cvAny.cvtColor(claheOut, out, cvAny.COLOR_GRAY2RGBA);
+        cvAny.imshow(c, out);
+      }
+    } catch (e) {
+      console.warn('enhanceReceiptCanvasAdobeLike failed', e);
+    } finally {
+      src?.delete?.();
+      rgba?.delete?.();
+      gray?.delete?.();
+      bg?.delete?.();
+      norm?.delete?.();
+      claheOut?.delete?.();
+      bw?.delete?.();
+      out?.delete?.();
+    }
+  }
+
+  // Mild enhancement (your old one, kept as fallback)
+  private enhanceReceiptCanvasMild(c: HTMLCanvasElement) {
     const cvAny: any = (window as any).cv;
     if (!cvAny?.imread) return;
 
@@ -941,7 +1039,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
       cvAny.imshow(c, out);
       out.delete();
     } catch (e) {
-      console.warn('enhanceReceiptCanvas failed', e);
+      console.warn('enhanceReceiptCanvasMild failed', e);
     } finally {
       src?.delete?.();
       gray?.delete?.();
@@ -950,7 +1048,7 @@ export class CameraScanComponent implements AfterViewInit, OnDestroy {
     }
   }
 
-  private sharpenCanvas(c: HTMLCanvasElement, amount = 0.25) {
+  private sharpenCanvas(c: HTMLCanvasElement, amount = 0.12) {
     const ctx = c.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
 
